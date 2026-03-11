@@ -35,6 +35,7 @@ from protenix.model.modules.embedders import (
     ConstraintEmbedder,
     InputFeatureEmbedder,
     RelativePositionEncoding,
+    SSEmbedder,
 )
 from protenix.model.modules.head import DistogramHead
 from protenix.model.modules.pairformer import (
@@ -132,6 +133,7 @@ class Protenix(nn.Module):
         self.constraint_embedder = ConstraintEmbedder(
             **configs.model.constraint_embedder
         )
+        self.ss_embedder = SSEmbedder(**configs.model.ss_embedder) if "ss_embedder" in configs.model else None
         self.pairformer_stack = PairformerStack(**configs.model.pairformer)
         self.diffusion_module = DiffusionModule(**configs.model.diffusion_module)
         self.distogram_head = DistogramHead(**configs.model.distogram_head)
@@ -217,6 +219,8 @@ class Protenix(nn.Module):
             )
             if z_constraint is not None:
                 z_init += z_constraint
+            if self.ss_embedder is not None and "rna_sec_struct" in input_feature_dict:
+                z_init += self.ss_embedder(input_feature_dict["rna_sec_struct"])
         else:
             z_init = z_init + self.relative_position_encoding(
                 input_feature_dict["relp"]
@@ -226,6 +230,8 @@ class Protenix(nn.Module):
             )
             if z_constraint is not None:
                 z_init = z_init + z_constraint
+            if self.ss_embedder is not None and "rna_sec_struct" in input_feature_dict:
+                z_init = z_init + self.ss_embedder(input_feature_dict["rna_sec_struct"])
         # Line 6
         z = torch.zeros_like(z_init)
         s = torch.zeros_like(s_init)

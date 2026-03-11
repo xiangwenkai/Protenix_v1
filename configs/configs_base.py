@@ -30,6 +30,7 @@ basic_configs = {
     "checkpoint_interval": -1,
     "eval_first": False,  # run evaluate() before training steps
     "iters_to_accumulate": 1,
+    "frozen_backbone": False,
     "finetune_params_with_substring": [
         ""
     ],  # params with substring will be finetuned with different learning rate: finetune_optim_configs["lr"]
@@ -205,6 +206,9 @@ model_configs = {
             "dropout": 0.25,
             "blocks_per_ckpt": GlobalConfigValue("blocks_per_ckpt"),
             "hidden_scale_up": GlobalConfigValue("hidden_scale_up"),
+        },
+        "ss_embedder": {
+            "c_z": GlobalConfigValue("c_z"),
         },
         "msa_module": {
             "c_m": 64,

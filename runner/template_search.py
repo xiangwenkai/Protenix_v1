@@ -232,7 +232,16 @@ def update_template_info(
 
 
 if __name__ == "__main__":
-    run_template_search(
-        msa_for_template_search_dir="examples/5sak/1",
-        msa_for_template_search_name="pairing,non_pairing",
-    )
+    # run_template_search(
+    #         msa_for_template_search_dir="examples/5sak/1",
+    #         msa_for_template_search_name="pairing,non_pairing",
+    #     )
+    PROTENIX_ROOT_DIR = os.environ.get("PROTENIX_ROOT_DIR", "/inspire/ssd/project/sais-bio/public/Protein/data/protenix_v1_dataset/")
+    dir_names = os.listdir(f"/inspire/ssd/project/sais-bio/public/xiangwenkai/GITHUB/Protenix/rna_data/mmcif_msa")
+    for dir_name in dir_names:
+        if os.path.exists(f"/inspire/ssd/project/sais-bio/public/xiangwenkai/GITHUB/Protenix/rna_data/mmcif_msa/{dir_name}/hmmsearch.a3m") == False:
+            print(f"processing: {dir_name}")
+            run_template_search(
+                msa_for_template_search_dir=f"/inspire/ssd/project/sais-bio/public/xiangwenkai/GITHUB/Protenix/rna_data/mmcif_msa/{dir_name}",
+                msa_for_template_search_name="pairing,non_pairing",
+            )

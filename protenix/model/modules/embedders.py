@@ -331,6 +331,35 @@ class SubstructureEmbedder(nn.Module):
 
             return x
 
+class SSEmbedder(nn.Module):
+    """
+    Implements RNA Secondary Structure Embedder.
+    Maps secondary structure features (LxL adjacency matrix) to pair representation.
+
+    Args:
+        c_z (int): output pair embedding dim.
+        num_bins (int): number of bins for SS feature (e.g., 2 for binary).
+    """
+    def __init__(self, c_z: int = 128, num_bins: int = 2) -> None:
+        super(SSEmbedder, self).__init__()
+        self.c_z = c_z
+        self.num_bins = num_bins
+        # Use Embedding for discrete inputs
+        self.embedding = nn.Embedding(num_bins, c_z)
+        self.gain = nn.Parameter(torch.zeros(1))
+
+    def forward(self, ss_feature: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            ss_feature (torch.Tensor): [..., N_token, N_token]
+        Returns:
+            torch.Tensor: [..., N_token, N_token, c_z]
+        """
+        # Ensure input is long for embedding lookup
+        # Clip values to be safe within [0, num_bins-1]
+        ss_feature = torch.clamp(ss_feature, 0, self.num_bins - 1).long()
+        return self.gain*self.embedding(ss_feature)
+
 
 class ConstraintEmbedder(nn.Module):
     """

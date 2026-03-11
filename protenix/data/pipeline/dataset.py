@@ -31,6 +31,7 @@ from protenix.data.constants import EvaluationChainInterface
 from protenix.data.constraint.constraint_featurizer import ConstraintFeatureGenerator
 from protenix.data.core.featurizer import Featurizer
 from protenix.data.msa.msa_featurizer import MSAFeaturizer
+from protenix.data.ss.ss_featurizer import SSFeaturizer
 from protenix.data.pipeline.data_pipeline import DataPipeline
 from protenix.data.template.template_featurizer import TemplateFeaturizer
 from protenix.data.tokenizer import TokenArray
@@ -62,6 +63,7 @@ class BaseSingleDataset(Dataset):
         cropping_configs: dict[str, Any],
         msa_featurizer: Optional[MSAFeaturizer] = None,
         template_featurizer: Optional[TemplateFeaturizer] = None,
+        ss_featurizer: Optional[SSFeaturizer] = None,
         name: str = None,
         **kwargs,
     ) -> None:
@@ -77,7 +79,7 @@ class BaseSingleDataset(Dataset):
         self.ref_pos_augment = kwargs.get("ref_pos_augment", True)
         self.lig_atom_rename = kwargs.get("lig_atom_rename", False)
         self.reassign_continuous_chain_ids = kwargs.get(
-            "reassign_continuous_chain_ids", False
+            "reassign_continuous_chain_ids", True
         )
         self.shuffle_mols = kwargs.get("shuffle_mols", False)
         self.shuffle_sym_ids = kwargs.get("shuffle_sym_ids", False)
@@ -121,6 +123,7 @@ class BaseSingleDataset(Dataset):
 
         self.msa_featurizer = msa_featurizer
         self.template_featurizer = template_featurizer
+        self.ss_featurizer = ss_featurizer
 
         # Read data
         self.indices_list = self.read_indices_list(indices_fpath)
@@ -260,12 +263,18 @@ class BaseSingleDataset(Dataset):
         """
         if self.name:
             logger.info("-" * 10 + f" Dataset {self.name}" + "-" * 10)
-        col1 = df["mol_1_type"].astype(str)
-        col2 = df["mol_2_type"].astype(str).str.replace("nan", "intra", regex=False)
-        lo = np.where(col1.values <= col2.values, col1.values, col2.values)
-        hi = np.where(col1.values <= col2.values, col2.values, col1.values)
-        df["mol_group_type"] = np.char.add(np.char.add(lo, "_"), hi)
-
+        df["mol_group_type"] = df.apply(
+            lambda row: "_".join(
+                sorted(
+                    [
+                        str(row["mol_1_type"]),
+                        str(row["mol_2_type"]).replace("nan", "intra"),
+                    ]
+                )
+            ),
+            axis=1,
+        )
+        
         group_size_dict = dict(df["mol_group_type"].value_counts())
         for i, n_i in group_size_dict.items():
             logger.info(f"{i}: {n_i}/{len(df)}({round(n_i*100/len(df), 2)}%)")
@@ -496,6 +505,7 @@ class BaseSingleDataset(Dataset):
             cropped_atom_array,
             cropped_msa_features,
             cropped_template_features,
+            cropped_ss_features,
             reference_token_index,
         ) = self.crop(
             sample_indice=sample_indice,
@@ -509,6 +519,7 @@ class BaseSingleDataset(Dataset):
             atom_array=cropped_atom_array,
             msa_features=cropped_msa_features,
             template_features=cropped_template_features,
+            ss_features=cropped_ss_features,
             full_atom_array=bioassembly_dict["atom_array"],
             is_spatial_crop="spatial" in crop_method.lower(),
             max_entity_mol_id=max_entity_mol_id,
@@ -573,13 +584,13 @@ class BaseSingleDataset(Dataset):
         spatial_crop_complete_lig: bool = True,
         drop_last: bool = True,
         remove_metal: bool = True,
-    ) -> tuple[str, TokenArray, AtomArray, dict[str, Any], dict[str, Any]]:
+    ) -> tuple[str, TokenArray, AtomArray, dict[str, Any], dict[str, Any], dict[str, Any]]:
         """
         Crops the bioassembly data based on the specified configurations.
 
         Returns:
             A tuple containing the cropping method, cropped token array, cropped atom array,
-                cropped MSA features, and cropped template features.
+                cropped MSA features, cropped template features, and cropped secondary structure features.
         """
         return DataPipeline.crop(
             one_sample=sample_indice,
@@ -587,6 +598,7 @@ class BaseSingleDataset(Dataset):
             crop_size=crop_size,
             msa_featurizer=self.msa_featurizer,
             template_featurizer=self.template_featurizer,
+            ss_featurizer=self.ss_featurizer,
             method_weights=method_weights,
             contiguous_crop_complete_lig=contiguous_crop_complete_lig,
             spatial_crop_complete_lig=spatial_crop_complete_lig,
@@ -712,6 +724,7 @@ class BaseSingleDataset(Dataset):
         atom_array: AtomArray,
         msa_features: dict[str, Any],
         template_features: dict[str, Any],
+        ss_features: dict[str, Any],
         full_atom_array: AtomArray,
         is_spatial_crop: bool = True,
         max_entity_mol_id: int = None,
@@ -728,6 +741,7 @@ class BaseSingleDataset(Dataset):
             atom_array: Atom array containing atomic information.
             msa_features: Dictionary of MSA features.
             template_features: Dictionary of template features.
+            ss_features: Dictionary of secondary structure features.
             full_atom_array: Full atom array containing all atoms.
             is_spatial_crop: Flag indicating whether spatial cropping is applied, by default True.
             max_entity_mol_id: Maximum entity mol ID in the full atom array.
@@ -843,6 +857,11 @@ class BaseSingleDataset(Dataset):
         else:
             template_features = dict_to_tensor(template_features)
             features_dict.update(template_features)
+            if len(ss_features) == 0:
+                dummy_feats.append("rna_sec_struct")
+            else:
+                ss_features = dict_to_tensor(ss_features)
+                features_dict.update(ss_features)
 
         features_dict = make_dummy_feature(
             features_dict=features_dict, dummy_feats=dummy_feats
@@ -891,6 +910,29 @@ def get_msa_featurizer(configs, dataset_name: str, stage: str) -> Optional[Calla
         enable_rna_msa=msa_args.enable_rna_msa,
     )
 
+def get_ss_featurizer(configs, dataset_name: str, stage: str) -> Optional[Callable]:
+    """
+    Creates and returns an SSFeaturizer object based on the provided configurations.
+    """
+    # Try to get SS config, if not present, return None or default
+    if "ss" not in configs["data"]:
+        return None
+        
+    ss_info = configs["data"]["ss"]
+    ss_args = deepcopy(ss_info)
+    ss_args["dataset_name"] = dataset_name
+    
+    # If the dataset has special SS settings, then overwrite the default SS settings
+    if "ss" in (dataset_config := configs["data"][dataset_name]):
+        for k, v in dataset_config["ss"].items():
+            ss_args[k] = v
+            
+    return SSFeaturizer(
+        dataset_name=ss_args.dataset_name,
+        rna_seq_or_filename_to_ss_jsons=ss_args.rna_seq_or_filename_to_ss_jsons,
+        rna_ss_raw_paths=ss_args.rna_ss_raw_paths,
+        enable_rna_ss=ss_args.enable_rna_ss,
+    )
 
 def get_template_featurizer(
     configs: ConfigDict, dataset_name: str, stage: str
@@ -1149,6 +1191,7 @@ def get_datasets(
             "template_featurizer": get_template_featurizer(
                 configs, dataset_name, stage
             ),
+            "ss_featurizer": get_ss_featurizer(configs, dataset_name, stage),
             "lig_atom_rename": config_dict.get("lig_atom_rename", False),
             "shuffle_mols": config_dict.get("shuffle_mols", False),
             "shuffle_sym_ids": config_dict.get("shuffle_sym_ids", False),

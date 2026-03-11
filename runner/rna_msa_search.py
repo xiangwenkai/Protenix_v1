@@ -21,6 +21,8 @@ import time
 from concurrent import futures
 from pathlib import Path
 from typing import Any, Optional, Union
+import json
+from collections import defaultdict
 
 from protenix.data.constants import RNA_CHAIN
 from protenix.data.msa.msa_utils import RawMsa
@@ -446,11 +448,68 @@ def update_rna_msa_info(
 
 
 if __name__ == "__main__":
-    example_seq = (
-        "GGCGCGUUAACAAAGCGGUUAUGUAGCGGAUUGCAAAUCCGUCUAGUCCGGUUCGACUCCGGAACGCGCCUCCA"
-    )
-    run_rna_msa_search(
-        rna_seq_for_msa_search=example_seq,
-        rna_result_path="./output",
-        rna_seq_id="rna_seq_1",
-    )
+    import pandas as pd
+    import json
+    PROTENIX_ROOT_DIR = os.environ.get("PROTENIX_ROOT_DIR", "/inspire/ssd/project/sais-bio/public/Protein/data/protenix_v1_dataset")
+    test_seqs = pd.read_csv('/inspire/ssd/project/sais-bio/public/xiangwenkai/GITHUB/Protenix/rna_data/rna_sequences_unique.txt',header=None)
+    test_seqs.columns = ['sequence']
+    # example_seq = (
+    #     "GGCGCGUUAACAAAGCGGUUAUGUAGCGGAUUGCAAAUCCGUCUAGUCCGGUUCGACUCCGGAACGCGCCUCCA"
+    # )
+    with open(f"{PROTENIX_ROOT_DIR}/rna_msa/rna_sequence_to_pdb_chains.json", 'r') as f:
+        rna_msas = json.load(f)
+    for i, seq in enumerate(test_seqs['sequence'].tolist()):
+        if len(seq) > 850:
+            continue
+        if i % 50 == 0:
+            print(f"{i} finished!!!!!!!!")
+        if seq in rna_msas:
+            sub_rna_dirs = rna_msas[seq]
+            for sub_rna_dir in sub_rna_dirs:
+                if os.path.exists(f"{PROTENIX_ROOT_DIR}/rna_msa/msas/{sub_rna_dir}") == True and os.path.exists(f"/inspire/ssd/project/sais-bio/public/xiangwenkai/GITHUB/Protenix/rna_data/rna_msa/msas/{sub_rna_dir}") == False:
+                    with open(f"/inspire/ssd/project/sais-bio/public/xiangwenkai/GITHUB/Protenix/rna_data/rna_id.txt", "a+") as f:
+                        f.write(f"{rna_msas[seq][0]}\t{seq}\n")
+                    os.system(f"cp -r {PROTENIX_ROOT_DIR}/rna_msa/msas/{rna_msas[seq][0]} /inspire/ssd/project/sais-bio/public/xiangwenkai/GITHUB/Protenix/rna_data/rna_msa/msas/{rna_msas[seq][0]}")
+                    break
+        else:
+            seq_id = f"r{i}"
+            if os.path.exists(f"/inspire/ssd/project/sais-bio/public/xiangwenkai/GITHUB/Protenix/rna_data/rna_msa/msas/{seq_id}") == False:
+                try:
+                    run_rna_msa_search(
+                        rna_seq_for_msa_search=seq,
+                        rna_result_path="/inspire/ssd/project/sais-bio/public/xiangwenkai/GITHUB/Protenix/rna_data/rna_msa/msas",
+                        rna_seq_id=seq_id,
+                        ntrna_database_path = f"{PROTENIX_ROOT_DIR}/search_database/nt_rna_2023_02_23_clust_seq_id_90_cov_80_rep_seq.fasta",
+                        rfam_database_path = f"{PROTENIX_ROOT_DIR}/search_database/rfam_14_9_clust_seq_id_90_cov_80_rep_seq.fasta",
+                        rna_central_database_path = f"{PROTENIX_ROOT_DIR}/search_database/rnacentral_active_seq_id_90_cov_80_linclust.fasta",
+                        nhmmer_n_cpu=32
+                    )
+                    with open(f"/inspire/ssd/project/sais-bio/public/xiangwenkai/GITHUB/Protenix/rna_data/rna_id.txt", "a+") as f:
+                        f.write(f"{seq_id}\t{seq}\n")
+                except:
+                    continue
+
+
+def process_txt_to_json(input_file, output_file):
+    # 使用 defaultdict(set) 可以自动处理重复值
+    data_map = defaultdict(set)
+    with open(input_file, 'r', encoding='utf-8') as f:
+        for line in f:
+            # 去除行尾换行符并按制表符 \t 分割
+            parts = line.strip().split('\t')
+            # 确保该行至少有两列
+            if len(parts) >= 2:
+                col1 = parts[0].strip()
+                col2 = parts[1].strip()
+                # 将第一列的值加入到以第二列为 key 的 set 中（自动去重）
+                data_map[col2].add(col1)
+    # 将 set 转换为 list，以便进行 JSON 序列化
+    final_data = {k: sorted(list(v)) for k, v in data_map.items()}
+    # 写入 JSON 文件
+    with open(output_file, 'w', encoding='utf-8') as jf:
+        json.dump(final_data, jf, indent=4, ensure_ascii=False)
+    print(f"处理完成！JSON 文件已保存至: {output_file}")
+
+
+# 使用示例
+process_txt_to_json('/inspire/ssd/project/sais-bio/public/xiangwenkai/GITHUB/Protenix/rna_data/rna_id.txt', '/inspire/ssd/project/sais-bio/public/xiangwenkai/GITHUB/Protenix/rna_data/rna_msa/rna_sequence_to_pdb_chains.json')

@@ -25,6 +25,7 @@ from biotite.structure import AtomArray
 
 from protenix.data.core.parser import DistillationMMCIFParser, MMCIFParser
 from protenix.data.msa.msa_featurizer import MSAFeaturizer
+from protenix.data.ss.ss_featurizer import SSFeaturizer
 from protenix.data.template.template_featurizer import TemplateFeaturizer
 from protenix.data.tokenizer import AtomArrayTokenizer, TokenArray
 from protenix.utils.cropping import CropData
@@ -201,6 +202,40 @@ class DataPipeline(object):
         return msa_feats
 
     @staticmethod
+    def get_ss_raw_features(
+        bioassembly_dict: dict[str, Any],
+        selected_indices: np.ndarray,
+        ss_featurizer: Optional[SSFeaturizer],
+    ) -> dict[str, np.ndarray]:
+        """
+        Get tokenized Secondary Structure features of the bioassembly
+
+        Args:
+            bioassembly_dict (Mapping[str, Any]): The bioassembly dict with sequence, atom_array and token_array.
+            selected_indices (torch.Tensor): Cropped token indices.
+            ss_featurizer (SSFeaturizer): SSFeaturizer instance.
+
+        Returns:
+            Optional[dict[str, np.ndarray]]: The tokenized SS features of the bioassembly.
+        """
+        if ss_featurizer is None:
+            return {}
+
+        entity_to_asym_id_int = dict(
+            DataPipeline.get_label_entity_id_to_asym_id_int(
+                bioassembly_dict["atom_array"]
+            )
+        )
+
+        ss_feats = ss_featurizer(
+            bioassembly_dict=bioassembly_dict,
+            selected_indices=selected_indices,
+            entity_to_asym_id_int=entity_to_asym_id_int,
+        )
+
+        return ss_feats
+
+    @staticmethod
     def get_template_raw_features(
         bioassembly_dict: dict[str, Any],
         selected_indices: np.ndarray,
@@ -241,12 +276,13 @@ class DataPipeline(object):
         crop_size: int,
         msa_featurizer: Optional[MSAFeaturizer],
         template_featurizer: Optional[TemplateFeaturizer],
+        ss_featurizer: Optional[SSFeaturizer] = None,
         method_weights: list[float] = [0.2, 0.4, 0.4],
         contiguous_crop_complete_lig: bool = False,
         spatial_crop_complete_lig: bool = False,
         drop_last: bool = False,
         remove_metal: bool = False,
-    ) -> tuple[str, TokenArray, AtomArray, dict[str, Any], dict[str, Any]]:
+    ) -> tuple[str, TokenArray, AtomArray, dict[str, Any], dict[str, Any], dict[str, Any]]:
         """
         Crop data based on the crop size and reference chain indices.
 
@@ -264,12 +300,13 @@ class DataPipeline(object):
             remove_metal (bool): Whether to remove metal atoms from the crop.
 
         Returns:
-            tuple[str, TokenArray, AtomArray, dict[str, Any], dict[str, Any]]:
+            tuple[str, TokenArray, AtomArray, dict[str, Any], dict[str, Any], dict[str, Any]]:
                 crop_method (str): The crop method.
                 cropped_token_array (TokenArray): TokenArray after cropping.
                 cropped_atom_array (AtomArray): AtomArray after cropping.
                 cropped_msa_features (dict[str, Any]): The cropped msa features.
                 cropped_template_features (dict[str, Any]): The cropped template features.
+                cropped_ss_features (dict[str, Any]): The cropped secondary structure features.
         """
         if crop_size <= 0:
             selected_indices = None
@@ -278,6 +315,12 @@ class DataPipeline(object):
                 bioassembly_dict=bioassembly_dict,
                 selected_indices=selected_indices,
                 msa_featurizer=msa_featurizer,
+            )
+            # Prepare ss
+            ss_features = DataPipeline.get_ss_raw_features(
+                bioassembly_dict=bioassembly_dict,
+                selected_indices=selected_indices,
+                ss_featurizer=ss_featurizer,
             )
             # Prepare template
             template_features = DataPipeline.get_template_raw_features(
@@ -291,6 +334,7 @@ class DataPipeline(object):
                 bioassembly_dict["atom_array"],
                 msa_features or {},
                 template_features or {},
+                ss_features or {},
                 -1,
             )
 
@@ -321,6 +365,12 @@ class DataPipeline(object):
             selected_indices=selected_indices,
             msa_featurizer=msa_featurizer,
         )
+        # Prepare ss
+        cropped_ss_features = DataPipeline.get_ss_raw_features(
+            bioassembly_dict=bioassembly_dict,
+            selected_indices=selected_indices,
+            ss_featurizer=ss_featurizer,
+        )
         # Prepare template
         cropped_template_features = DataPipeline.get_template_raw_features(
             bioassembly_dict=bioassembly_dict,
@@ -344,6 +394,7 @@ class DataPipeline(object):
             cropped_atom_array,
             cropped_msa_features,
             cropped_template_features,
+            cropped_ss_features,
             reference_token_index,
         )
 
