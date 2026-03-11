@@ -97,6 +97,79 @@ def get_atom_mask_by_name(
     return mask
 
 
+def extract_token_coordinates(
+    atom_coordinates: Union[torch.Tensor, np.ndarray],
+    centre_atom_mask: Union[torch.Tensor, np.ndarray]
+) -> Union[torch.Tensor, np.ndarray]:
+    """
+    从原子坐标中提取token中心原子坐标
+
+    Args:
+        atom_coordinates: [N_atom, 3] 所有原子坐标
+        centre_atom_mask: [N_atom] 标记哪些原子是token中心
+
+    Returns:
+        token_coordinates: [N_token, 3] token中心原子坐标
+    """
+    if isinstance(atom_coordinates, torch.Tensor):
+        return atom_coordinates[centre_atom_mask.bool()]
+    else:
+        return atom_coordinates[centre_atom_mask.astype(bool)]
+
+
+def expand_token_to_atom_coordinates(
+    token_coordinates: Union[torch.Tensor, np.ndarray],
+    centre_atom_mask: Union[torch.Tensor, np.ndarray],
+    template_atom_coordinates: Optional[Union[torch.Tensor, np.ndarray]] = None
+) -> Union[torch.Tensor, np.ndarray]:
+    """
+    将token坐标扩展为完整原子坐标
+
+    对于token中心原子，使用预测的token坐标
+    对于其他原子，如果提供template则使用template，否则置零或使用理想几何
+
+    Args:
+        token_coordinates: [N_token, 3] or [..., N_token, 3] token中心原子坐标
+        centre_atom_mask: [N_atom] 标记哪些原子是token中心
+        template_atom_coordinates: [N_atom, 3] 模板原子坐标（可选）
+
+    Returns:
+        atom_coordinates: [N_atom, 3] or [..., N_atom, 3] 完整原子坐标
+    """
+    is_torch = isinstance(token_coordinates, torch.Tensor)
+
+    # 确定输出形状
+    if token_coordinates.ndim == 2:
+        # [N_token, 3] -> [N_atom, 3]
+        n_atoms = len(centre_atom_mask)
+        if is_torch:
+            atom_coordinates = torch.zeros(n_atoms, 3, dtype=token_coordinates.dtype, device=token_coordinates.device)
+            atom_coordinates[centre_atom_mask.bool()] = token_coordinates
+        else:
+            atom_coordinates = np.zeros((n_atoms, 3), dtype=token_coordinates.dtype)
+            atom_coordinates[centre_atom_mask.astype(bool)] = token_coordinates
+    else:
+        # [..., N_token, 3] -> [..., N_atom, 3]
+        prefix_shape = token_coordinates.shape[:-2]
+        n_atoms = len(centre_atom_mask)
+        if is_torch:
+            atom_coordinates = torch.zeros(*prefix_shape, n_atoms, 3, dtype=token_coordinates.dtype, device=token_coordinates.device)
+            atom_coordinates[..., centre_atom_mask.bool(), :] = token_coordinates
+        else:
+            atom_coordinates = np.zeros((*prefix_shape, n_atoms, 3), dtype=token_coordinates.dtype)
+            atom_coordinates[..., centre_atom_mask.astype(bool), :] = token_coordinates
+
+    # 如果提供了template，使用template填充非中心原子
+    if template_atom_coordinates is not None:
+        non_centre_mask = ~(centre_atom_mask.bool() if is_torch else centre_atom_mask.astype(bool))
+        if is_torch:
+            atom_coordinates[..., non_centre_mask, :] = template_atom_coordinates[non_centre_mask]
+        else:
+            atom_coordinates[..., non_centre_mask, :] = template_atom_coordinates[non_centre_mask]
+
+    return atom_coordinates
+
+
 def remove_numbers(s: str) -> str:
     """
     Remove numbers from a string.

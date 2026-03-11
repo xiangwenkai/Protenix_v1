@@ -407,38 +407,40 @@ class Featurizer(object):
         Returns:
             Dict[str, torch.Tensor]: a dict of reference features.
         """
-        ref_pos = np.empty_like(self.cropped_atom_array.ref_pos)
+        # Token-level: only use centre atom positions
+        ref_pos_all = np.empty_like(self.cropped_atom_array.ref_pos)
         for ref_space_uid in np.unique(self.cropped_atom_array.ref_space_uid):
             mask = self.cropped_atom_array.ref_space_uid == ref_space_uid
-            ref_pos[mask] = random_transform(
+            ref_pos_all[mask] = random_transform(
                 self.cropped_atom_array.ref_pos[mask],
                 apply_augmentation=self.ref_pos_augment,
                 centralize=True,
             )
 
+        # Extract token centre atom positions only
+        centre_atom_mask = self.cropped_atom_array.centre_atom_mask.astype(bool)
+        ref_pos = ref_pos_all[centre_atom_mask]  # [N_token, 3]
+
         ref_features = {}
-        ref_features["ref_pos"] = torch.Tensor(ref_pos)
+        ref_features["ref_pos"] = torch.Tensor(ref_pos)  # Now [N_token, 3] instead of [N_atom, 3]
+        ref_features["centre_atom_mask"] = torch.from_numpy(
+            self.cropped_atom_array.centre_atom_mask.astype(np.int64)
+        )  # Keep this for reference
+        # Token-level: keep token-level masks only
+        # ref_mask now indicates which tokens have valid coordinates
         ref_features["ref_mask"] = torch.from_numpy(
-            self.cropped_atom_array.ref_mask.astype(np.int64)
-        )
-        ref_features["ref_element"] = Featurizer.elem_onehot_encoded(
-            self.cropped_atom_array.element
-        ).long()
-        ref_features["ref_charge"] = torch.from_numpy(
-            self.cropped_atom_array.ref_charge.astype(np.int64)
-        )
+            self.cropped_atom_array.ref_mask[centre_atom_mask].astype(np.int64)
+        )  # [N_token]
 
-        if self.lig_atom_rename:
-            atom_names = self.get_renamed_atom_names()
-        else:
-            atom_names = self.cropped_atom_array.atom_name
+        # Token-level: atom-specific features not needed for TokenDiffusionModule
+        # These are only used by AtomAttentionEncoder which we don't use anymore
+        # ref_features["ref_element"] = ...  # Not needed
+        # ref_features["ref_charge"] = ...  # Not needed
+        # ref_features["ref_atom_name_chars"] = ...  # Not needed
 
-        ref_features["ref_atom_name_chars"] = Featurizer.ref_atom_name_chars_encoded(
-            atom_names
-        ).long()
         ref_features["ref_space_uid"] = torch.from_numpy(
-            self.cropped_atom_array.ref_space_uid.astype(np.int64)
-        )
+            self.cropped_atom_array.ref_space_uid[centre_atom_mask].astype(np.int64)
+        )  # [N_token]
 
         token_array_with_frame = self.get_token_frame(
             token_array=self.cropped_token_array,
@@ -536,28 +538,28 @@ class Featurizer(object):
         Returns:
             Dict[str, torch.Tensor]: a dict of extra features.
         """
-        atom_to_token_idx = self._get_atom_to_token_idx()
+        # Token-level: atom_to_token_idx not needed anymore
+        # atom_to_token_idx = self._get_atom_to_token_idx()
 
         extra_features = {}
-        extra_features["atom_to_token_idx"] = torch.from_numpy(
-            atom_to_token_idx.astype(np.int64)
-        )
-        extra_features["atom_to_tokatom_idx"] = torch.from_numpy(
-            self.cropped_atom_array.tokatom_idx.astype(np.int64)
-        )
+        # Token-level: no need for atom_to_token_idx
+        # extra_features["atom_to_token_idx"] = ...
+        # extra_features["atom_to_tokatom_idx"] = ...
 
+        # Convert atom-level features to token-level (using centre_atom_mask)
+        centre_atom_mask = self.cropped_atom_array.centre_atom_mask.astype(bool)
         extra_features["is_protein"] = torch.from_numpy(
-            self.cropped_atom_array.is_protein.astype(np.int64)
-        )
+            self.cropped_atom_array.is_protein[centre_atom_mask].astype(np.int64)
+        )  # [N_token]
         extra_features["is_ligand"] = torch.from_numpy(
-            self.cropped_atom_array.is_ligand.astype(np.int64)
-        )
+            self.cropped_atom_array.is_ligand[centre_atom_mask].astype(np.int64)
+        )  # [N_token]
         extra_features["is_dna"] = torch.from_numpy(
-            self.cropped_atom_array.is_dna.astype(np.int64)
-        )
+            self.cropped_atom_array.is_dna[centre_atom_mask].astype(np.int64)
+        )  # [N_token]
         extra_features["is_rna"] = torch.from_numpy(
-            self.cropped_atom_array.is_rna.astype(np.int64)
-        )
+            self.cropped_atom_array.is_rna[centre_atom_mask].astype(np.int64)
+        )  # [N_token]
         if "resolution" in self.cropped_atom_array._annot:
             extra_features["resolution"] = torch.Tensor(
                 [self.cropped_atom_array.resolution[0]]

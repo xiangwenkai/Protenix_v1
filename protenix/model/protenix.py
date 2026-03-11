@@ -25,12 +25,14 @@ import torch.nn.functional as F
 from protenix.model import sample_confidence
 from protenix.model.generator import (
     InferenceNoiseScheduler,
-    sample_diffusion,
-    sample_diffusion_training,
     TrainingNoiseSampler,
 )
+from protenix.model.generator_token import (
+    sample_token_diffusion,
+    sample_token_diffusion_training,
+)
 from protenix.model.modules.confidence import ConfidenceHead
-from protenix.model.modules.diffusion import DiffusionModule
+from protenix.model.modules.diffusion_token import TokenDiffusionModule
 from protenix.model.modules.embedders import (
     ConstraintEmbedder,
     InputFeatureEmbedder,
@@ -54,38 +56,17 @@ logger = get_logger(__name__)
 
 def update_input_feature_dict(input_feature_dict: dict[str, Any]) -> dict[str, Any]:
     """
-    Lines 1-3 of Algorithm 5 compute d_lm, v_lm, and pad_info utilized in the AtomAttentionEncoder.
+    Token-level version: No need to compute d_lm, v_lm for AtomAttentionEncoder.
+    Directly returns input_feature_dict as token-level diffusion doesn't need these.
+
     Args:
             input_feature_dict (dict[str, Any]): input features
     Returns:
             input_feature_dict (dict[str, Any]): input features
     """
-    from protenix.model.modules.transformer import rearrange_qk_to_dense_trunk
-
-    with torch.no_grad():
-        # Prepare tensors in dense trunks for local operations
-        q_trunked_list, k_trunked_list, pad_info = rearrange_qk_to_dense_trunk(
-            q=[input_feature_dict["ref_pos"], input_feature_dict["ref_space_uid"]],
-            k=[input_feature_dict["ref_pos"], input_feature_dict["ref_space_uid"]],
-            dim_q=[-2, -1],
-            dim_k=[-2, -1],
-            n_queries=32,
-            n_keys=128,
-            compute_mask=True,
-        )
-        # Compute atom pair feature
-        d_lm = (
-            q_trunked_list[0][..., None, :] - k_trunked_list[0][..., None, :, :]
-        )  # [..., n_blocks, n_queries, n_keys, 3]
-        v_lm = (
-            q_trunked_list[1][..., None].int() == k_trunked_list[1][..., None, :].int()
-        ).unsqueeze(
-            dim=-1
-        )  # [..., n_blocks, n_queries, n_keys, 1]
-        input_feature_dict["d_lm"] = d_lm
-        input_feature_dict["v_lm"] = v_lm
-        input_feature_dict["pad_info"] = pad_info
-        return input_feature_dict
+    # Token-level diffusion doesn't need atom-level features
+    # ref_pos is already token-level coordinates
+    return input_feature_dict
 
 
 class Protenix(nn.Module):
@@ -133,7 +114,8 @@ class Protenix(nn.Module):
             **configs.model.constraint_embedder
         )
         self.pairformer_stack = PairformerStack(**configs.model.pairformer)
-        self.diffusion_module = DiffusionModule(**configs.model.diffusion_module)
+        # Use TokenDiffusionModule for token-level structure prediction
+        self.diffusion_module = TokenDiffusionModule(**configs.model.diffusion_module)
         self.distogram_head = DistogramHead(**configs.model.distogram_head)
         self.confidence_head = ConfidenceHead(**configs.model.confidence_head)
 
@@ -305,10 +287,10 @@ class Protenix(nn.Module):
 
     def sample_diffusion(self, **kwargs: Any) -> torch.Tensor:
         """
-        Samples diffusion process based on the provided configurations.
+        Token-level diffusion sampling.
 
         Returns:
-            torch.Tensor: The result of the diffusion sampling process.
+            torch.Tensor: Token coordinates [N_sample, N_token, 3]
         """
         _configs = {
             key: self.configs.sample_diffusion.get(key)
@@ -332,7 +314,7 @@ class Protenix(nn.Module):
             }
         )
         return autocasting_disable_decorator(self.configs.skip_amp.sample_diffusion)(
-            sample_diffusion
+            sample_token_diffusion
         )(**_configs, **kwargs)
 
     def run_confidence_head(self, *args: Any, **kwargs: Any) -> Any:
@@ -525,33 +507,17 @@ class Protenix(nn.Module):
         noise_schedule = self.inference_noise_scheduler(
             N_step=N_step, device=s_inputs.device, dtype=s_inputs.dtype
         )
+        # Token-level: only cache pair_z, no atom attention cache needed
         cache = dict()
         if self.enable_diffusion_shared_vars_cache:
-            # line 1-5 of algorithm 21 calculate z in diffusion conditioning
             cache["pair_z"] = autocasting_disable_decorator(
                 self.configs.skip_amp.sample_diffusion
             )(self.diffusion_module.diffusion_conditioning.prepare_cache)(
                 input_feature_dict["relp"], z, False
             )
-            cache["p_lm/c_l"] = autocasting_disable_decorator(
-                self.configs.skip_amp.sample_diffusion
-            )(self.diffusion_module.atom_attention_encoder.prepare_cache)(
-                ref_pos=input_feature_dict["ref_pos"],
-                ref_charge=input_feature_dict["ref_charge"],
-                ref_mask=input_feature_dict["ref_mask"],
-                ref_element=input_feature_dict["ref_element"],
-                ref_atom_name_chars=input_feature_dict["ref_atom_name_chars"],
-                atom_to_token_idx=input_feature_dict["atom_to_token_idx"],
-                d_lm=input_feature_dict["d_lm"],
-                v_lm=input_feature_dict["v_lm"],
-                pad_info=input_feature_dict["pad_info"],
-                r_l=True,
-                z=cache["pair_z"],
-                inplace_safe=False,
-            )
         else:
             cache["pair_z"] = None
-            cache["p_lm/c_l"] = [None, None]
+
         pred_dict["coordinate"] = self.sample_diffusion(
             denoise_net=self.diffusion_module,
             input_feature_dict=input_feature_dict,
@@ -559,8 +525,6 @@ class Protenix(nn.Module):
             s_trunk=s,
             z_trunk=None if cache["pair_z"] is not None else z,
             pair_z=cache["pair_z"],
-            p_lm=cache["p_lm/c_l"][0],
-            c_l=cache["p_lm/c_l"][1],
             N_sample=N_sample,
             noise_schedule=noise_schedule,
             inplace_safe=inplace_safe,
@@ -684,6 +648,7 @@ class Protenix(nn.Module):
         log_dict = {}
         pred_dict = {}
 
+        # Token-level: only cache pair_z
         cache = dict()
         if self.enable_diffusion_shared_vars_cache:
             cache["pair_z"] = autocasting_disable_decorator(
@@ -691,28 +656,12 @@ class Protenix(nn.Module):
             )(self.diffusion_module.diffusion_conditioning.prepare_cache)(
                 input_feature_dict["relp"], z, False
             )
-            cache["p_lm/c_l"] = autocasting_disable_decorator(
-                self.configs.skip_amp.sample_diffusion
-            )(self.diffusion_module.atom_attention_encoder.prepare_cache)(
-                ref_pos=input_feature_dict["ref_pos"],
-                ref_charge=input_feature_dict["ref_charge"],
-                ref_mask=input_feature_dict["ref_mask"],
-                ref_element=input_feature_dict["ref_element"],
-                ref_atom_name_chars=input_feature_dict["ref_atom_name_chars"],
-                atom_to_token_idx=input_feature_dict["atom_to_token_idx"],
-                d_lm=input_feature_dict["d_lm"],
-                v_lm=input_feature_dict["v_lm"],
-                pad_info=input_feature_dict["pad_info"],
-                r_l=True,
-                z=cache["pair_z"],
-                inplace_safe=False,
-            )
         else:
             cache["pair_z"] = None
-            cache["p_lm/c_l"] = [None, None]
+
         # Mini-rollout: used for confidence and label permutation
         with torch.no_grad():
-            # [..., 1, N_atom, 3]
+            # [..., 1, N_token, 3]
             N_sample_mini_rollout = self.configs.sample_diffusion[
                 "N_sample_mini_rollout"
             ]  # =1
@@ -725,16 +674,6 @@ class Protenix(nn.Module):
                 s_trunk=s.detach(),
                 z_trunk=None if cache["pair_z"] is not None else z.detach(),
                 pair_z=None if cache["pair_z"] is None else cache["pair_z"].detach(),
-                p_lm=(
-                    None
-                    if cache["p_lm/c_l"][0] is None
-                    else cache["p_lm/c_l"][0].detach()
-                ),
-                c_l=(
-                    None
-                    if cache["p_lm/c_l"][1] is None
-                    else cache["p_lm/c_l"][1].detach()
-                ),
                 N_sample=N_sample_mini_rollout,
                 noise_schedule=self.inference_noise_scheduler(
                     N_step=N_step_mini_rollout,
@@ -790,7 +729,7 @@ class Protenix(nn.Module):
             return pred_dict, label_dict, log_dict
 
         # Denoising: use permuted coords to generate noisy samples and perform denoising
-        # x_denoised: [..., N_sample, N_atom, 3]
+        # Token-level: x_denoised: [..., N_sample, N_token, 3]
         # x_noise_level: [..., N_sample]
         N_sample = self.diffusion_batch_size
         drop_conditioning = (
@@ -798,7 +737,7 @@ class Protenix(nn.Module):
         )
         _, x_denoised, x_noise_level = autocasting_disable_decorator(
             self.configs.skip_amp.sample_diffusion_training
-        )(sample_diffusion_training)(
+        )(sample_token_diffusion_training)(
             noise_sampler=self.train_noise_sampler,
             denoise_net=self.diffusion_module,
             label_dict=label_dict,
@@ -807,8 +746,6 @@ class Protenix(nn.Module):
             s_trunk=s,
             z_trunk=None if cache["pair_z"] is not None else z,
             pair_z=cache["pair_z"],
-            p_lm=cache["p_lm/c_l"][0],
-            c_l=cache["p_lm/c_l"][1],
             N_sample=N_sample,
             diffusion_chunk_size=self.configs.diffusion_chunk_size,
             use_conditioning=not drop_conditioning,
@@ -819,7 +756,7 @@ class Protenix(nn.Module):
                 "distogram": autocasting_disable_decorator(True)(self.distogram_head)(
                     z
                 ),
-                # [..., N_sample=48, N_atom, 3]: diffusion loss
+                # [..., N_sample=48, N_token, 3]: token-level diffusion loss
                 "coordinate": x_denoised,
                 "noise_level": x_noise_level,
             }
