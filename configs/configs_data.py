@@ -252,7 +252,7 @@ data_configs = {
         **deepcopy(default_test_configs),
     },
     "msa": {
-        "enable_prot_msa": True,
+        "enable_prot_msa": False,
         "prot_seq_or_filename_to_msadir_jsons": ListValue(
             [os.path.join(PROTENIX_ROOT_DIR, "common/seq_to_pdb_index.json")]
         ),
@@ -265,7 +265,7 @@ data_configs = {
         ),  # Separated by "-", "pairing-non_pairing" means both pairing and non_pairing are used as non_pairing,
         # with pairing used first.
         "prot_indexing_methods": ListValue(["sequence"]),
-        "enable_rna_msa": True,  # enable rna msa
+        "enable_rna_msa": False,  # enable rna msa
         "rna_seq_or_filename_to_msadir_jsons": ListValue(
             [os.path.join(custom_rna_dir, "rna_msa/rna_sequence_to_pdb_chains.json")]
         ),
@@ -289,10 +289,10 @@ data_configs = {
     "ss": {
         "enable_rna_ss": False,  # enable rna ss
         "rna_seq_or_filename_to_ss_jsons": ListValue(
-            [os.path.join(PROTENIX_ROOT_DIR, "rna_ss/rna_sequence_to_pdb_chains_custom.json")]
+            [os.path.join(PROTENIX_ROOT_DIR, "rna_ss_contrafold/rna_sequence_to_pdb_chains.json")]
         ),
         "rna_ss_raw_paths": ListValue(
-            [os.path.join(PROTENIX_ROOT_DIR, "rna_ss/ss")]
+            [os.path.join(PROTENIX_ROOT_DIR, "rna_ss_contrafold/ss")]
         ),
     },
     "template": {
