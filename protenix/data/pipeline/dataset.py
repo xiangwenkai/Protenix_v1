@@ -44,8 +44,24 @@ from protenix.utils.file_io import read_indices_csv
 from protenix.utils.logger import get_logger
 from protenix.utils.torch_utils import dict_to_tensor
 
+from tqdm import tqdm
+from collections import defaultdict
+import hashlib
+
 logger = get_logger(__name__)
 
+VALID_RNA_NUCLEOTIDES = {'A', 'C', 'G', 'U'}
+INVALID_SEQUENCE_CHARS = {'-', 'X'}
+# ==================== Default Values and Limits ====================
+DEFAULT_CROP_SIZE = 256
+INVALID_COORDINATE_VALUE = -1e8
+TOKEN_COUNT_DEFAULT = 1
+ZERO_COORDINATE = np.array([0.0, 0.0, 0.0])
+# Template limits
+MAX_TEMPLATES = 4  # Maximum number of templates read per target (up to 40 available)
+MAX_TEMPLATE_FEATURES = 4  # Maximum number of templates after featurization
+valid_ids = [21,22,23,24,25]
+rna_id_map = {21: 'A', 22: 'G', 23: 'C', 24: 'U', 25: 'N'}
 
 class BaseSingleDataset(Dataset):
     """
@@ -63,6 +79,7 @@ class BaseSingleDataset(Dataset):
         msa_featurizer: Optional[MSAFeaturizer] = None,
         template_featurizer: Optional[TemplateFeaturizer] = None,
         name: str = None,
+        mode: str = None,
         **kwargs,
     ) -> None:
         super(BaseSingleDataset, self).__init__()
@@ -124,6 +141,24 @@ class BaseSingleDataset(Dataset):
 
         # Read data
         self.indices_list = self.read_indices_list(indices_fpath)
+        
+        self.temporal_cutoff = None
+        self.rna_msa_dir = None
+        self.mode = mode
+        # self.data_list = self.read_sequences(sequences_csv_fpath=f'/inspire/ssd/project/sais-bio/public/xiangwenkai/GITHUB/RNAPro/release_data/kaggle/train_sequences.v2.1.csv')
+        # valid_target_ids = {item["name"] for item in self.data_list}
+        templates_csv_fpath = Path('/inspire/ssd/project/sais-bio/public/xiangwenkai/GITHUB/RProtenix/release_data/rna_templates.csv')
+        if templates_csv_fpath and not Path(templates_csv_fpath).exists():
+            raise FileNotFoundError(f"Templates file not found: {templates_csv_fpath}")
+        self.templates_csv_fpath = Path(templates_csv_fpath) if templates_csv_fpath else None
+        # Read template data if provided
+        if self.templates_csv_fpath:
+            self.templates_dict = self.read_templates(
+                templates_csv_fpath=self.templates_csv_fpath,
+                valid_target_ids=None
+            )
+        else:
+            self.templates_dict = {}
 
     @staticmethod
     def read_pdb_list(pdb_list: Union[list, str]) -> Optional[list]:
@@ -150,6 +185,394 @@ class BaseSingleDataset(Dataset):
                     pdb_filter_list.append(l)
         return pdb_filter_list
 
+    def find_rna_sequences(self, bioassembly_dict: dict[str, Any]) -> list:
+        token_array = bioassembly_dict['token_array']
+        n = len(token_array)
+        
+        
+        rna_results = []
+        i = 0
+        while i < n:
+            if token_array[i].value in valid_ids:
+                start = i
+                seqs = []
+                while i < n and token_array[i].value in valid_ids:
+                    seqs.append(rna_id_map[token_array[i].value])
+                    i += 1
+                end = i - 1
+                rna_seq = ''.join(seqs)
+                hash_id = hashlib.md5(rna_seq.encode('utf-8')).hexdigest()
+                if hash_id in self.templates_dict:
+                    rna_results.append((hash_id, 1, start, end))
+                else:
+                    for seq in sorted(list(bioassembly_dict['sequences'].keys()), key=len, reverse=True):
+                        kr = int(len(rna_seq)/len(seq))
+                        if seq in rna_seq and seq * kr == rna_seq:
+                            rna_results.append((hash_id, kr, start, end))
+            else:
+                i += 1
+        return rna_results
+
+
+    def generate_templates(self, bioassembly_dict: dict[str, Any]) -> torch.Tensor:
+        """
+        Args:
+            token_array (list/tensor): 
+            selected_indices (list/tensor): 
+            rna_embeddings (dict): 
+            embedding_dim (int): 
+        
+        Returns:
+            torch.Tensor:  rna_feature
+        """
+        n = bioassembly_dict['num_tokens']
+        rna_results = self.find_rna_sequences(bioassembly_dict['token_array'])
+        
+        # init tensor with zero
+        template = torch.zeros((n, 3), dtype=torch.float32)
+        if rna_results:
+            for rna_seq, start, end in rna_results:
+                hash_id = hashlib.md5(rna_seq.encode('utf-8')).hexdigest()
+                if hash_id in self.templates_dict:
+                    template[start:end+1] = self.templates_dict[hash_id]
+                else:
+                    for seq in sorted(list(bioassembly_dict['sequences'].keys()), key=len, reverse=True):
+                        kr = int(len(rna_seq)/len(seq))
+                        if seq in rna_seq and seq * kr == rna_seq:
+                            template[start:end+1] = self.templates_dict[hash_id].repeat(kr, 1)
+        return template
+
+    def read_sequences(
+        self, sequences_csv_fpath: Union[str, Path]
+    ) -> list[dict]:
+        """
+        Read and filter RNA sequences from CSV.
+        
+        Args:
+            sequences_csv_fpath: Path to sequences CSV.
+                
+        Returns:
+            List of dicts with "name" and "sequences" (containing rnaSequence data).
+            
+        Filters:
+            - Invalid characters ('-', 'X')
+            - Exceeds max_n_token
+            - Published after temporal_cutoff
+        """
+        try:
+            df = pd.read_csv(sequences_csv_fpath)
+        except Exception as e:
+            raise FileNotFoundError(f"Failed to read sequences CSV file {sequences_csv_fpath}: {e}") from e
+        
+        try:
+            df["temporal_cutoff"] = pd.to_datetime(df["temporal_cutoff"])
+        except Exception as e:
+            logger.warning(f"Failed to parse temporal_cutoff dates: {e}. Continuing without temporal filtering.")
+            df["temporal_cutoff"] = pd.NaT
+
+        data_list = []
+        print('#'*20, 'before filtering', len(df))
+        num_cutoff = 0
+        num_limit = 0
+        num_invalid = 0
+        for _, row in df.iterrows():
+            target_id = row["target_id"]
+            sequence = row["sequence"]
+
+            # Filter sequences with invalid nucleotide characters
+            if any(char in sequence for char in INVALID_SEQUENCE_CHARS):
+                logger.debug(f"Skipping sequence {target_id} with invalid characters")
+                continue
+
+            # # Skip sequences exceeding maximum token limit
+            # if self.max_n_token > 0 and len(sequence) > self.max_n_token:
+            #     logger.debug(f"Skipping sequence {target_id} (length {len(sequence)} > {self.max_n_token})")
+            #     continue
+            
+            if self.temporal_cutoff is not None:
+                # Skip if cutoff is after self.temporal_cutoff
+                if self.mode == 'test':
+                    if row["temporal_cutoff"] < self.temporal_cutoff:
+                        num_cutoff += 1
+                        continue
+                else:
+                    if row["temporal_cutoff"] >= self.temporal_cutoff:
+                        num_cutoff += 1
+                        continue
+
+            data_list.append(
+                {
+                    "sequences": [
+                        {
+                            "rnaSequence": {
+                                "sequence": sequence,
+                                "count": TOKEN_COUNT_DEFAULT,
+                                "msa": {
+                                    "precomputed_msa_dir": self.rna_msa_dir,
+                                    "pairing_db": "",
+                                },
+                            },
+                        }
+                    ],
+                    "name": target_id,
+                }
+            )
+        print('#'*20, 'after filtering', len(data_list))
+        print('#'*20, f"num_cutoff: {num_cutoff}, num_limit: {num_limit}, num_invalid: {num_invalid}")
+        return data_list
+    
+    def read_templates(
+        self, templates_csv_fpath: Union[str, Path], valid_target_ids: set[str]
+    ) -> dict[str, list[dict]]:
+        """
+        Read and process RNA template C1' coordinates from CSV.
+        
+        Args:
+            templates_csv_fpath: Path to templates CSV with columns:
+                ID, resname, resid, {x/y/z}_{template_idx} (1-40).
+            valid_target_ids: Target IDs to include.
+            
+        Returns:
+            Dict mapping target_id to list of template dicts with:
+                {"coords": np.ndarray (n_res, 3), "coords_mask": np.ndarray (n_res,)}
+        """
+        try:
+            df = pd.read_csv(templates_csv_fpath)
+        except Exception as e:
+            raise FileNotFoundError(f"Failed to read templates CSV file {templates_csv_fpath}: {e}") from e
+        
+        df.fillna(INVALID_COORDINATE_VALUE, inplace=True)
+        
+        # Pre-compute target_ids to avoid string operations in loop
+        df['target_id'] = df['ID'].str.rsplit('_', n=1).str[0]
+        
+        # Filter to only valid target IDs early to save processing time
+        if valid_target_ids is not None:
+            df = df[df['target_id'].isin(valid_target_ids)]
+        
+        if len(df) == 0:
+            logger.warning("No template data found for any of the valid target IDs")
+            return {}
+        
+        templates_dict = defaultdict(list)
+        
+        # Process each template index (1 to MAX_TEMPLATES)
+        for template_idx in tqdm(range(1, MAX_TEMPLATES + 1), desc="Processing templates"):
+            # Check if this template index has C1' coordinate data
+            coord_cols = [
+                f"x_{template_idx}",
+                f"y_{template_idx}", 
+                f"z_{template_idx}"
+            ]
+            
+            # Check if template columns exist
+            existing_coord_cols = [col for col in coord_cols if col in df.columns]
+            
+            if len(existing_coord_cols) != 3:
+                # Need all 3 coordinate columns for this template
+                continue
+            
+            # Filter rows where this template has valid data (not all NaN/invalid)
+            template_df = df.dropna(subset=existing_coord_cols, how='all')
+            if len(template_df) == 0:
+                continue
+                
+            # Group by target_id and process efficiently
+            for target_id, group in template_df.groupby('target_id'):
+                # Extract C1' coordinates only
+                coords_matrix = group[existing_coord_cols].values.astype(np.float32)  # Shape: (n_residues, 3)
+                n_residues = len(group)
+                
+                # Create coordinate mask (1 for valid coords, 0 for missing)
+                coords_mask = (coords_matrix[:, 0] > INVALID_COORDINATE_VALUE).astype(np.int32)  # Shape: (n_residues,)
+                
+                # Create template data structure
+                template_data = {
+                    "coords": coords_matrix,  # Shape: (n_residues, 3)
+                    "coords_mask": coords_mask,  # Shape: (n_residues,)
+                }
+                
+                templates_dict[target_id].append(template_data)
+        
+        # Convert defaultdict to regular dict
+        templates_dict = dict(templates_dict)
+        
+        logger.info(f"Loaded templates for {len(templates_dict)} targets, "
+                   f"total templates: {sum(len(templates) for templates in templates_dict.values())}")
+        
+        return templates_dict
+
+    def _crop_templates(
+        self,
+        templates: list[dict],
+        selected_indices: np.array,
+    ) -> list[dict]:
+        """Crop template coordinates to match sequence cropping."""
+        cropped_templates = []
+        
+        for template in templates:
+            # Crop template coordinates and masks
+            coords = template["coords"][selected_indices]  # Shape: (cropped_len, 3)
+            coords_mask = template["coords_mask"][selected_indices]  # Shape: (cropped_len,)
+            
+            cropped_template = {
+                "coords": coords,
+                "coords_mask": coords_mask,
+            }
+            
+            cropped_templates.append(cropped_template)
+        
+        return cropped_templates
+    
+    def _crop_template_features(
+        self,
+        template_features: dict,
+        selected_indices: np.array,
+    ) -> list[dict]:
+        """Crop template coordinates to match sequence cropping."""
+        
+        template_features['template_coords'] = template_features['template_coords'][:, selected_indices, :]
+        template_features['template_coords_mask'] = template_features['template_coords_mask'][:, selected_indices]
+        return template_features
+    
+    def _create_template_features(
+        self,
+        templates: list[dict],
+        token_array: TokenArray,
+        atom_array: AtomArray
+    ) -> dict:
+        """
+        Convert template coordinates to model-compatible features.
+        
+        Args:
+            templates: List of template dicts with coords and coords_mask.
+            token_array: Token array for dimension matching.
+            atom_array: Atom array (unused).
+            
+        Returns:
+            Dict with template_coords, template_coords_mask, n_templates.
+            Uses first MAX_TEMPLATE_FEATURES (4) templates, shuffled during training.
+        """
+        if not templates:
+            return {}
+        
+        # If template_featurizer is available, use it
+        if self.template_featurizer is not None:
+            # Convert templates to format expected by template_featurizer
+            # This would need to be implemented based on the specific featurizer interface
+            return self.template_featurizer.create_features(templates, token_array, atom_array)
+        
+        # Otherwise, initialize template feature arrays for C1' coordinates only
+        n_residues = len(token_array)
+        template_coords = np.zeros((MAX_TEMPLATE_FEATURES, n_residues, 3), dtype=np.float32)  # C1' coordinates
+        template_coords_mask = np.zeros((MAX_TEMPLATE_FEATURES, n_residues), dtype=np.int32)  # C1' validity mask
+        
+        # Fill template data
+        # Shuffle templates during training, use first MAX_TEMPLATE_FEATURES during evaluation
+        if self.mode == 'train' and len(templates) > MAX_TEMPLATE_FEATURES:
+            # Training mode: randomly select templates via shuffled indices
+            indices = np.random.permutation(len(templates))[:MAX_TEMPLATE_FEATURES]
+            templates_to_use = [templates[i] for i in indices]
+        else:
+            # Evaluation mode (or fewer templates than needed): use first MAX_TEMPLATE_FEATURES templates
+            templates_to_use = templates[:MAX_TEMPLATE_FEATURES]
+        
+        n_templates = 0  # Number of valid templates 
+        for template_idx, template in enumerate(templates_to_use):
+            coords = template["coords"]  # Shape: (template_residues, 3)
+            coords_mask = template["coords_mask"]  # Shape: (template_residues,)
+            
+            # Ensure template data matches expected dimensions
+            seq_len = min(coords.shape[0], n_residues)
+            
+            template_coords[template_idx, :seq_len] = coords[:seq_len]  # Copy C1' coordinates
+            template_coords_mask[template_idx, :seq_len] = coords_mask[:seq_len]  # Copy validity mask
+
+            # Count only templates with at least one valid coordinate
+            if np.any(coords_mask[:seq_len]):
+                n_templates += 1
+        
+        template_features = {
+            "template_coords": torch.from_numpy(template_coords),  # Shape: (n_templates, n_residues, 3)
+            "template_coords_mask": torch.from_numpy(template_coords_mask),  # Shape: (n_templates, n_residues)
+            "n_templates": torch.tensor([n_templates]),
+        }
+        
+        return template_features
+    
+    def create_complex_template_features(
+        self,
+        bioassembly_dict: dict
+    ) -> dict:
+        """
+        Convert template coordinates to model-compatible features.
+        
+        Args:
+            templates: List of template dicts with coords and coords_mask.
+            token_array: Token array for dimension matching.
+            atom_array: Atom array (unused).
+            
+        Returns:
+            Dict with template_coords, template_coords_mask, n_templates.
+            Uses first MAX_TEMPLATE_FEATURES (4) templates, shuffled during training.
+        """
+        
+        # Otherwise, initialize template feature arrays for C1' coordinates only
+        n_residues = len(bioassembly_dict['token_array'])
+        template_coords = np.zeros((MAX_TEMPLATE_FEATURES, n_residues, 3), dtype=np.float32)  # C1' coordinates
+        template_coords_mask = np.zeros((MAX_TEMPLATE_FEATURES, n_residues), dtype=np.int32)  # C1' validity mask
+        
+        rna_results = self.find_rna_sequences(bioassembly_dict)
+        
+        if not rna_results:
+            return {
+                    "template_coords": np.zeros((1, n_residues, 3), dtype=np.float32),  # Shape: (n_templates, n_residues, 3)
+                    "template_coords_mask": np.zeros((1, n_residues), dtype=np.int32),  # Shape: (n_templates, n_residues)
+                    "n_templates": torch.tensor([1]),
+                   }
+        
+        # Fill template data
+        # Shuffle templates during training, use first MAX_TEMPLATE_FEATURES during evaluation
+        templates_to_use = [[] for _ in range(len(rna_results))]
+        l_templates = len(self.templates_dict[rna_results[0][0]])
+        if not self.mode and l_templates > MAX_TEMPLATE_FEATURES:
+            # Training mode: randomly select templates via shuffled indices
+            for i in range(len(rna_results)):
+                indices = np.random.permutation(l_templates)[:MAX_TEMPLATE_FEATURES]
+                templates_to_use[i] = [self.templates_dict[rna_results[i][0]][j] for j in indices]
+        else:
+            # Evaluation mode (or fewer templates than needed): use first MAX_TEMPLATE_FEATURES templates
+            for i in range(len(rna_results)):
+                templates_to_use[i] = self.templates_dict[rna_results[i][0]][:MAX_TEMPLATE_FEATURES]
+            
+            
+        n_templates = 0  # Number of valid templates 
+        for template_idx in range(len(templates_to_use[0])):
+            for rna_id in range(len(rna_results)):
+                seq_len = rna_results[rna_id][3] - rna_results[rna_id][2] + 1
+                template_coords[template_idx, rna_results[rna_id][2]:rna_results[rna_id][3]+1] = np.tile(templates_to_use[rna_id][template_idx]["coords"][:seq_len], (rna_results[rna_id][1], 1))  # Copy C1' coordinates
+                template_coords_mask[template_idx, rna_results[rna_id][2]:rna_results[rna_id][3]+1] = np.tile(templates_to_use[rna_id][template_idx]["coords_mask"][:seq_len], (rna_results[rna_id][1], 1))
+                
+            # Count only templates with at least one valid coordinate
+            if np.any(templates_to_use[rna_id][template_idx]["coords"][:seq_len]):
+                n_templates += 1
+        
+        template_features = {
+            "template_coords": torch.from_numpy(template_coords),  # Shape: (n_templates, n_residues, 3)
+            "template_coords_mask": torch.from_numpy(template_coords_mask),  # Shape: (n_templates, n_residues)
+            "n_templates": torch.tensor([n_templates]),
+        }
+        
+        if n_templates > 0:
+            return template_features
+        else:
+            print("Error when find templates!!! (protenix/data/dataset.py)")
+            return {
+                    "template_coords": np.zeros((1, n_residues, 3), dtype=np.float32),  # Shape: (n_templates, n_residues, 3)
+                    "template_coords_mask": np.zeros((1, n_residues), dtype=np.int32),  # Shape: (n_templates, n_residues)
+                    "n_templates": torch.tensor([1]),
+                   }
+    
     def read_indices_list(self, indices_fpath: Union[str, Path]) -> pd.DataFrame:
         """
         Reads and processes a list of indices from a CSV file.
@@ -171,6 +594,7 @@ class BaseSingleDataset(Dataset):
 
         # Filter by max_n_token
         if self.max_n_token > 0:
+            indices_list = indices_list[indices_list['num_tokens'].notnull()]
             valid_mask = indices_list["num_tokens"].astype(int) <= self.max_n_token
             removed_list = indices_list[~valid_mask]
             indices_list = indices_list[valid_mask]
@@ -489,19 +913,34 @@ class BaseSingleDataset(Dataset):
 
         max_entity_mol_id = bioassembly_dict["atom_array"].entity_mol_id.max()
 
+        if self.templates_dict:
+            # templates = self.generate_templates(bioassembly_dict)
+            # cropped_templates = self._crop_templates(templates, selected_indices)
+            # cropped_template_features = self._create_template_features(cropped_templates, cropped_token_array, cropped_atom_array)
+            template_features = self.create_complex_template_features(bioassembly_dict)
+            
         # Crop
         (
             crop_method,
             cropped_token_array,
             cropped_atom_array,
             cropped_msa_features,
-            cropped_template_features,
+            cropped_template_features_,
             reference_token_index,
+            selected_indices
         ) = self.crop(
             sample_indice=sample_indice,
             bioassembly_dict=bioassembly_dict,
             **self.cropping_configs,
         )
+        
+        cropped_template_features = {}
+        if self.templates_dict:
+            if len(template_features) > 0:
+                if selected_indices is not None:
+                    cropped_template_features = self._crop_template_features(template_features, selected_indices)
+                else:
+                    cropped_template_features = template_features
 
         feat, label, label_full = self.get_feature_and_label(
             idx=idx,
@@ -1171,7 +1610,7 @@ def get_datasets(
             "train_ref_pos_augment", True
         )
         dataset_param["limits"] = data_config.get("limits", -1)
-        train_dataset = BaseSingleDataset(**dataset_param)
+        train_dataset = BaseSingleDataset(**dataset_param, mode='train')
         train_datasets.append(train_dataset)
         datapoint_weights.append(
             get_sample_weights(
@@ -1194,6 +1633,6 @@ def get_datasets(
             config_dict, dataset_name=test_name, stage="test"
         )
         dataset_param["ref_pos_augment"] = data_config.get("test_ref_pos_augment", True)
-        test_dataset = BaseSingleDataset(**dataset_param)
+        test_dataset = BaseSingleDataset(**dataset_param, mode='test')
         test_datasets[test_name] = test_dataset
     return train_dataset, test_datasets

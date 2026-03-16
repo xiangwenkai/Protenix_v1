@@ -248,7 +248,10 @@ class Protenix(nn.Module):
                     if self.template_embedder.n_blocks > 0:
                         z += self.template_embedder(
                             input_feature_dict,
+                            s_inputs,
+                            s,
                             z,
+                            pair_mask=input_feature_dict.get("pair_mask"),
                             triangle_multiplicative=self.configs.triangle_multiplicative,
                             triangle_attention=self.configs.triangle_attention,
                             inplace_safe=inplace_safe,
@@ -268,7 +271,10 @@ class Protenix(nn.Module):
                     if self.template_embedder.n_blocks > 0:
                         z = z + self.template_embedder(
                             input_feature_dict,
+                            s_inputs,
+                            s,
                             z,
+                            pair_mask=input_feature_dict.get("pair_mask"),
                             triangle_multiplicative=self.configs.triangle_multiplicative,
                             triangle_attention=self.configs.triangle_attention,
                             inplace_safe=inplace_safe,

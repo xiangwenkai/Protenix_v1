@@ -30,6 +30,7 @@ basic_configs = {
     "checkpoint_interval": -1,
     "eval_first": False,  # run evaluate() before training steps
     "iters_to_accumulate": 1,
+    "frozen_backbone": False,
     "finetune_params_with_substring": [
         ""
     ],  # params with substring will be finetuned with different learning rate: finetune_optim_configs["lr"]
@@ -198,13 +199,22 @@ model_configs = {
             "s_max": 2,
             "c_z": GlobalConfigValue("c_z"),
         },
-        "template_embedder": {
-            "c": 64,
+        # "template_embedder": {
+        #     "c": 64,
+        #     "c_z": GlobalConfigValue("c_z"),
+        #     "n_blocks": 0,
+        #     "dropout": 0.25,
+        #     "blocks_per_ckpt": GlobalConfigValue("blocks_per_ckpt"),
+        #     "hidden_scale_up": GlobalConfigValue("hidden_scale_up"),
+        # },
+        "template_embedder": {  # RNA-only Template Embedder
+            "n_blocks": 2,
+            "c_s": GlobalConfigValue("c_s"),
             "c_z": GlobalConfigValue("c_z"),
-            "n_blocks": 0,
-            "dropout": 0.25,
+            "c_s_inputs": GlobalConfigValue("c_s_inputs"),
+            "pairformer_dropout": 0.15,
             "blocks_per_ckpt": GlobalConfigValue("blocks_per_ckpt"),
-            "hidden_scale_up": GlobalConfigValue("hidden_scale_up"),
+            "zero_init_final_linear": True,
         },
         "msa_module": {
             "c_m": 64,

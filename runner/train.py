@@ -80,6 +80,7 @@ class AF3Trainer(object):
         self.start_step = 0
         # Add for grad accumulation, it can increase real batch size
         self.iters_to_accumulate = self.configs.iters_to_accumulate
+        self.frozen_backbone = self.configs.frozen_backbone
 
         self.run_name = self.configs.run_name + "_" + time.strftime("%Y%m%d_%H%M%S")
         run_names = DIST_WRAPPER.all_gather_object(
@@ -333,6 +334,12 @@ class AF3Trainer(object):
                 state_dict=checkpoint["model"],
                 strict=self.configs.load_strict,
             )
+            
+            if self.frozen_backbone:
+                for name, param in self.model.named_parameters():
+                    if name in checkpoint["model"].keys():
+                        param.requires_grad = False
+                        
             if not load_params_only:
                 if not skip_load_optimizer:
                     self.print("Loading optimizer state")
