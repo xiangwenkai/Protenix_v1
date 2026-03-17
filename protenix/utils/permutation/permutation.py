@@ -214,16 +214,18 @@ class SymmetricPermutation(object):
             global_align_wo_symmetric_atom=self.configs.atom_permutation.global_align_wo_symmetric_atom,
         )
         if permute_pred_indices:
-            # Update `permute_pred_indices' according to the results of atom permutation
-            updated_permute_pred_indices = []
-            assert len(permute_pred_indices) == len(atom_perm_pred_indices)
-            for chain_perm_indices, atom_perm_indices in zip(
-                permute_pred_indices, atom_perm_pred_indices
-            ):
-                updated_permute_pred_indices.append(
-                    chain_perm_indices[atom_perm_indices]
-                )
-            permute_pred_indices = updated_permute_pred_indices
+            if atom_perm_pred_indices is not None:
+                # Update `permute_pred_indices' according to the results of atom permutation
+                updated_permute_pred_indices = []
+                assert len(permute_pred_indices) == len(atom_perm_pred_indices)
+                for chain_perm_indices, atom_perm_indices in zip(
+                    permute_pred_indices, atom_perm_pred_indices
+                ):
+                    updated_permute_pred_indices.append(
+                        chain_perm_indices[atom_perm_indices]
+                    )
+                permute_pred_indices = updated_permute_pred_indices
+            # If atom_perm_pred_indices is None (token-level model), keep chain perm indices as-is
         elif atom_perm_pred_indices is not None:
             permute_pred_indices = [
                 atom_perm_indices for atom_perm_indices in atom_perm_pred_indices
@@ -392,26 +394,32 @@ class SymmetricPermutation(object):
         Args:
             pred_dict (dict): A dictionary containing the predicted components.
             permute_pred_indices (list): A list of tensors, each containing the predicted indices for the permutation of a diffusion sample.
-            atom_to_token_idx (torch.Tensor): A tensor mapping each atom to its corresponding token index. Shape: [N_atom].
-            rep_atom_mask (torch.Tensor): A boolean mask indicating which atoms are representative. Shape: [N_atom].
+            atom_to_token_idx (torch.Tensor): A tensor mapping each atom to its corresponding token index. Shape: [N_atom]. None in token-level models.
+            rep_atom_mask (torch.Tensor): A boolean mask indicating which atoms are representative. Shape: [N_atom] (atom-level) or [N_token] all-ones (token-level).
 
         Returns:
             dict: The updated `pred_dict`
         """
 
         for i, perm_indices in enumerate(permute_pred_indices):
-            # permute atoms at dim=-2
+            if atom_to_token_idx is not None:
+                # Atom-level model: derive token indices from atom-level permutation
+                perm_atom_to_token_idx = atom_to_token_idx[perm_indices]
+                perm_rep_atom_mask = rep_atom_mask[perm_indices]
+                perm_token_indices = perm_atom_to_token_idx[perm_rep_atom_mask]
+            else:
+                # Token-level model: perm_indices are already token-level
+                perm_token_indices = perm_indices
+
+            # permute tokens at dim=-2 (plddt/resolved are token-level in both models)
             for key in ["plddt", "resolved"]:
                 if key in pred_dict:
-                    assert pred_dict[key].size(-2) == len(perm_indices)
+                    assert pred_dict[key].size(-2) == len(perm_token_indices)
                     pred_dict[key][..., i, :, :] = pred_dict[key][
-                        ..., i, perm_indices, :
+                        ..., i, perm_token_indices, :
                     ]
 
             # permute tokens at dim=-2 and -3
-            perm_atom_to_token_idx = atom_to_token_idx[perm_indices]
-            perm_rep_atom_mask = rep_atom_mask[perm_indices]
-            perm_token_indices = perm_atom_to_token_idx[perm_rep_atom_mask]
             for key in ["pae", "pde"]:
                 if key in pred_dict:
                     assert (
@@ -485,7 +493,7 @@ class SymmetricPermutation(object):
             pred_dict = self.permute_heads(
                 pred_dict,
                 permute_pred_indices=permute_pred_indices,
-                atom_to_token_idx=input_feature_dict["atom_to_token_idx"],
+                atom_to_token_idx=input_feature_dict.get("atom_to_token_idx"),
                 rep_atom_mask=input_feature_dict["pae_rep_atom_mask"].bool(),
             )
 
