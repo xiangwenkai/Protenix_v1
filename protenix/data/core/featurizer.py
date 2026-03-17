@@ -355,22 +355,25 @@ class Featurizer(object):
         The chain permutation use "entity_mol_id", "mol_id" and "mol_atom_index"
         instead of the "entity_id", "asym_id" and "residue_index".
 
-        The shape of these features is [N_atom].
+        The shape of these features is [N_token] (token-level, using distogram_rep_atom_mask).
 
         Returns:
             Dict[str, torch.Tensor]: A dict of chain permutation features.
         """
+        # Use distogram_rep_atom_mask to convert to token-level, consistent with
+        # get_labels() and get_gt_full_complex_features()
+        rep_mask = self.cropped_atom_array.distogram_rep_atom_mask.astype(bool)
 
         chain_perm_features = {}
         chain_perm_features["mol_id"] = torch.from_numpy(
-            self.cropped_atom_array.mol_id.astype(np.int64)
-        )
+            self.cropped_atom_array.mol_id[rep_mask].astype(np.int64)
+        )  # [N_token]
         chain_perm_features["mol_atom_index"] = torch.from_numpy(
-            self.cropped_atom_array.mol_atom_index.astype(np.int64)
-        )
+            self.cropped_atom_array.mol_atom_index[rep_mask].astype(np.int64)
+        )  # [N_token]
         chain_perm_features["entity_mol_id"] = torch.from_numpy(
-            self.cropped_atom_array.entity_mol_id.astype(np.int64)
-        )
+            self.cropped_atom_array.entity_mol_id[rep_mask].astype(np.int64)
+        )  # [N_token]
         return chain_perm_features
 
     def get_renamed_atom_names(self) -> np.ndarray:
@@ -660,9 +663,9 @@ class Featurizer(object):
         """
         mask_features = {}
 
-        mask_features["pae_rep_atom_mask"] = torch.from_numpy(
-            self.cropped_atom_array.centre_atom_mask.astype(np.int64)
-        )
+        # Token-level: all tokens are representative atoms, so mask is all ones [N_token]
+        n_token = int(self.cropped_atom_array.distogram_rep_atom_mask.sum())
+        mask_features["pae_rep_atom_mask"] = torch.ones(n_token, dtype=torch.int64)
 
         mask_features["plddt_m_rep_atom_mask"] = torch.from_numpy(
             self.cropped_atom_array.plddt_m_rep_atom_mask.astype(np.int64)
@@ -845,18 +848,24 @@ class Featurizer(object):
                 mask = mask * np.isin(atom_array.mol_id, asyms)
             atom_array = atom_array[mask]
 
-        gt_features["coordinate"] = torch.Tensor(atom_array.coord)
+        # Use distogram_rep_atom_mask to convert to token-level features,
+        # consistent with get_labels() which also uses distogram_rep_atom_mask.
+        rep_mask = atom_array.distogram_rep_atom_mask.astype(bool)
+        gt_features["coordinate"] = torch.Tensor(atom_array.coord[rep_mask])  # [N_token, 3]
         gt_features["coordinate_mask"] = torch.from_numpy(
-            atom_array.is_resolved.astype(np.int64)
-        )
+            atom_array.is_resolved[rep_mask].astype(np.int64)
+        )  # [N_token]
         gt_features["entity_mol_id"] = torch.from_numpy(
-            atom_array.entity_mol_id.astype(np.int64)
-        )
-        gt_features["mol_id"] = torch.from_numpy(atom_array.mol_id.astype(np.int64))
+            atom_array.entity_mol_id[rep_mask].astype(np.int64)
+        )  # [N_token]
+        gt_features["mol_id"] = torch.from_numpy(
+            atom_array.mol_id[rep_mask].astype(np.int64)
+        )  # [N_token]
         gt_features["mol_atom_index"] = torch.from_numpy(
-            atom_array.mol_atom_index.astype(np.int64)
-        )
-        gt_features["pae_rep_atom_mask"] = torch.from_numpy(
-            atom_array.centre_atom_mask.astype(np.int64)
-        )
+            atom_array.mol_atom_index[rep_mask].astype(np.int64)
+        )  # [N_token]
+        # All entries are representative atoms at token level, so mask is all ones
+        gt_features["pae_rep_atom_mask"] = torch.ones(
+            int(rep_mask.sum()), dtype=torch.int64
+        )  # [N_token]
         return gt_features, atom_array
