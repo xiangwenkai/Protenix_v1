@@ -667,9 +667,7 @@ class Featurizer(object):
         n_token = int(self.cropped_atom_array.distogram_rep_atom_mask.sum())
         mask_features["pae_rep_atom_mask"] = torch.ones(n_token, dtype=torch.int64)
 
-        mask_features["plddt_m_rep_atom_mask"] = torch.from_numpy(
-            self.cropped_atom_array.plddt_m_rep_atom_mask.astype(np.int64)
-        )  # [N_atom]
+        mask_features["plddt_m_rep_atom_mask"] = torch.ones(n_token, dtype=torch.int64)  # [N_token]
 
         mask_features["distogram_rep_atom_mask"] = torch.from_numpy(
             self.cropped_atom_array.distogram_rep_atom_mask.astype(np.int64)

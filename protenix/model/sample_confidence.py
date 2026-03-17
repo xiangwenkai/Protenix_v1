@@ -696,8 +696,7 @@ def calculate_chain_based_plddt(
     assert N_chain == asym_id.max() + 1  # make sure it is from 0 to N_chain-1
 
     def _calculate_lddt_with_token_mask(token_mask):
-        atom_mask = token_mask[atom_to_token_idx]
-        sub_plddt = atom_plddt[:, atom_mask].mean(-1)
+        sub_plddt = atom_plddt[:, token_mask].mean(-1)
         return sub_plddt
 
     batch_shape = atom_plddt.shape[:-1]
