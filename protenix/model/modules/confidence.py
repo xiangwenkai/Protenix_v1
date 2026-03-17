@@ -110,11 +110,11 @@ class ConfidenceHead(nn.Module):
         self.linear_no_bias_pde = LinearNoBias(
             in_features=self.c_z, out_features=self.b_pde
         )
-        self.plddt_weight = nn.Parameter(
-            data=torch.empty(size=(self.max_atoms_per_token, self.c_s, self.b_plddt))
+        self.linear_no_bias_plddt = LinearNoBias(
+            in_features=self.c_s, out_features=self.b_plddt
         )
-        self.resolved_weight = nn.Parameter(
-            data=torch.empty(size=(self.max_atoms_per_token, self.c_s, self.b_resolved))
+        self.linear_no_bias_resolved = LinearNoBias(
+            in_features=self.c_s, out_features=self.b_resolved
         )
 
         self.input_strunk_ln = LayerNorm(self.c_s)
@@ -127,8 +127,8 @@ class ConfidenceHead(nn.Module):
             # Zero init for output layer (before softmax) to zero
             nn.init.zeros_(self.linear_no_bias_pae.weight)
             nn.init.zeros_(self.linear_no_bias_pde.weight)
-            nn.init.zeros_(self.plddt_weight)
-            nn.init.zeros_(self.resolved_weight)
+            nn.init.zeros_(self.linear_no_bias_plddt.weight)
+            nn.init.zeros_(self.linear_no_bias_resolved.weight)
 
     def forward(
         self,
@@ -188,10 +188,8 @@ class ConfidenceHead(nn.Module):
             else:
                 z_trunk = 0 * z_trunk
 
-        x_rep_atom_mask = input_feature_dict[
-            "distogram_rep_atom_mask"
-        ].bool()  # [N_atom]
-        x_pred_rep_coords = x_pred_coords[..., x_rep_atom_mask, :]
+        # Token-level model: x_pred_coords is already [..., N_sample, N_token, 3]
+        x_pred_rep_coords = x_pred_coords
         N_sample = x_pred_rep_coords.size(-3)
 
         z_init = (
@@ -317,32 +315,14 @@ class ConfidenceHead(nn.Module):
         # Upcast after pairformer
         z_pair = z_pair.to(torch.float32)
         s_single = s_single.to(torch.float32)
-        atom_to_token_idx = input_feature_dict[
-            "atom_to_token_idx"
-        ]  # in range [0, N_token-1] shape: [N_atom]
-        atom_to_tokatom_idx = input_feature_dict[
-            "atom_to_tokatom_idx"
-        ]  # in range [0, max_atoms_per_token-1] shape: [N_atom] # influenced by crop
-
         with torch.amp.autocast("cuda", enabled=False):
             pae_pred = self.linear_no_bias_pae(self.pae_ln(z_pair))
             pde_pred = self.linear_no_bias_pde(
                 self.pde_ln(z_pair + z_pair.transpose(-2, -3))
             )
-            # Broadcast s_single: [N_tokens, c_s] -> [N_atoms, c_s]
-            a = broadcast_token_to_atom(
-                x_token=s_single, atom_to_token_idx=atom_to_token_idx
-            )
-            plddt_pred = torch.einsum(
-                "...nc,ncb->...nb",
-                self.plddt_ln(a),
-                self.plddt_weight[atom_to_tokatom_idx],
-            )
-            resolved_pred = torch.einsum(
-                "...nc,ncb->...nb",
-                self.resolved_ln(a),
-                self.resolved_weight[atom_to_tokatom_idx],
-            )
+            # Token-level model: s_single is already [..., N_token, c_s]
+            plddt_pred = self.linear_no_bias_plddt(self.plddt_ln(s_single))
+            resolved_pred = self.linear_no_bias_resolved(self.resolved_ln(s_single))
         if not self.training and z_pair.shape[-2] > 2000:
             torch.cuda.empty_cache()
         return plddt_pred, pae_pred, pde_pred, resolved_pred
