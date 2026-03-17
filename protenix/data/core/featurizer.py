@@ -724,13 +724,14 @@ class Featurizer(object):
 
         labels = {}
 
+        rep_atom_mask = self.cropped_atom_array.distogram_rep_atom_mask.astype(bool)
         labels["coordinate"] = torch.Tensor(
-            self.cropped_atom_array.coord
-        )  # [N_atom, 3]
+            self.cropped_atom_array.coord[rep_atom_mask]
+        )  # [N_token, 3]
 
         labels["coordinate_mask"] = torch.from_numpy(
-            self.cropped_atom_array.is_resolved.astype(np.int64)
-        )  # [N_atom]
+            self.cropped_atom_array.is_resolved[rep_atom_mask].astype(np.int64)
+        )  # [N_token]
         return labels
 
     def get_atom_permutation_list(
