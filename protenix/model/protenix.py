@@ -598,14 +598,14 @@ class Protenix(nn.Module):
             token_asym_id=input_feature_dict["asym_id"],
             token_has_frame=input_feature_dict["has_frame"],
             atom_coordinate=pred_dict["coordinate"],
-            atom_to_token_idx=input_feature_dict["atom_to_token_idx"],
+            atom_to_token_idx=input_feature_dict.get("atom_to_token_idx"),
             atom_is_polymer=1 - input_feature_dict["is_ligand"],
             N_recycle=N_cycle,
             interested_atom_mask=interested_atom_mask,
             return_full_data=True,
             mol_id=(input_feature_dict["mol_id"] if mode != "inference" else None),
             elements_one_hot=(
-                input_feature_dict["ref_element"] if mode != "inference" else None
+                input_feature_dict.get("ref_element") if mode != "inference" else None
             ),
         )
 

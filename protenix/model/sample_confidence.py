@@ -85,6 +85,12 @@ def _compute_full_data_and_summary(
             - summary_confidence: List of dictionaries containing summary confidence scores.
             - full_data: List of dictionaries containing full data if `return_full_data` is True.
     """
+    # In token-level model, atom_to_token_idx is None; use identity mapping
+    if atom_to_token_idx is None:
+        N_token = token_asym_id.shape[0]
+        atom_to_token_idx = torch.arange(
+            N_token, dtype=torch.long, device=token_asym_id.device
+        )
     atom_is_ligand = (1 - atom_is_polymer).long()
     token_is_ligand = torch.zeros_like(token_asym_id).scatter_add(
         0, atom_to_token_idx, atom_is_ligand
