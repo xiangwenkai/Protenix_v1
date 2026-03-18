@@ -263,8 +263,8 @@ class Featurizer(object):
         Args:
             token_array (TokenArray): A list of tokens.
             atom_array (AtomArray): An atom array.
-            ref_pos (torch.Tensor): Atom positions in the reference conformer. Size=[N_atom, 3]
-            ref_mask (torch.Tensor): Mask indicating which atom slots are used in the reference conformer. Size=[N_atom]
+            ref_pos (torch.Tensor): Atom positions in the reference conformer. Size=[N_token, 3] (token-level in token-level model)
+            ref_mask (torch.Tensor): Mask indicating which atom slots are used in the reference conformer. Size=[N_token] (token-level)
 
         Returns:
             TokenArray: A TokenArray with updated frame annotations.
@@ -282,15 +282,27 @@ class Featurizer(object):
             | (~np.isin(atom_array.res_name, list(STD_RESIDUES.keys())))
             | atom_level_token_mask
         ]
+
+        # Token-level: ref_pos is now token-level, need to map atom-level ref_space_uid to token indices
+        rep_mask = atom_array.distogram_rep_atom_mask.astype(bool)
+        rep_atom_indices = np.where(rep_mask)[0]  # atom-level indices of representative atoms
+        atom_to_token_idx = np.full(len(atom_array), -1, dtype=np.int64)
+        atom_to_token_idx[rep_atom_indices] = np.arange(len(rep_atom_indices))
+
         for ref_space_uid in np.unique(lig_atom_array.ref_space_uid):
             # The ref_space_uid is the unique identifier ID for each residue.
             atom_ids = np.where(atom_array.ref_space_uid == ref_space_uid)[0]
-            if len(atom_ids) >= 3:
-                kdtree = KDTree(ref_pos[atom_ids], metric="euclidean")
+            # Convert atom-level indices to token-level indices
+            token_ids = atom_to_token_idx[atom_ids]
+            # Filter out invalid token indices (-1)
+            valid_token_ids = token_ids[token_ids >= 0]
+
+            if len(valid_token_ids) >= 3:
+                kdtree = KDTree(ref_pos[valid_token_ids], metric="euclidean")
             else:
                 # Invalid frame
                 kdtree = None
-            lig_res_ref_conf_kdtree[ref_space_uid] = (kdtree, atom_ids)
+            lig_res_ref_conf_kdtree[ref_space_uid] = (kdtree, valid_token_ids)
 
         has_frame = []
         for token in token_array_w_frame:
