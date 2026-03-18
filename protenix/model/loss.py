@@ -1518,7 +1518,7 @@ class ProtenixLoss(nn.Module):
         lddt_mask = compute_lddt_mask(
             true_distance=distance,
             distance_mask=distance_mask,
-            is_nucleotide=feat_dict["token_is_rna"].bool() + feat_dict["token_is_dna"].bool(),
+            is_nucleotide=feat_dict["is_rna"].bool() + feat_dict["is_dna"].bool(),
             **self.lddt_radius,
         )
 
@@ -1710,9 +1710,9 @@ class ProtenixLoss(nn.Module):
                         pred_coordinate=pred_dict["coordinate"],
                         true_coordinate=label_dict["coordinate"],
                         coordinate_mask=label_dict["coordinate_mask"],
-                        is_rna=feat_dict["token_is_rna"],
-                        is_dna=feat_dict["token_is_dna"],
-                        is_ligand=feat_dict["token_is_ligand"],
+                        is_rna=feat_dict["is_rna"],
+                        is_dna=feat_dict["is_dna"],
+                        is_ligand=feat_dict["is_ligand"],
                         per_sample_scale=diffusion_per_sample_scale,
                     ),
                 }
@@ -1759,10 +1759,10 @@ class ProtenixLoss(nn.Module):
                         ..., coord_mask, :
                     ].detach(),
                     true_coordinate=label_dict["coordinate"][..., coord_mask, :],
-                    is_nucleotide=(feat_dict["token_is_rna"] + feat_dict["token_is_dna"])[
+                    is_nucleotide=(feat_dict["is_rna"] + feat_dict["is_dna"])[
                         coord_mask
                     ].bool(),
-                    is_polymer=1 - feat_dict["token_is_ligand"][coord_mask],
+                    is_polymer=1 - feat_dict["is_ligand"][coord_mask],
                     rep_atom_mask=feat_dict["plddt_m_rep_atom_mask"][coord_mask].bool(),
                     **self.lddt_radius,
                 )

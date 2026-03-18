@@ -195,8 +195,8 @@ class AttentionPairBias(nn.Module):
 
         # Broadcast bias batch dimension to match q if needed
         # In inference with N_sample, z might have batch size 1 but q has batch size N_sample
-        if bias.shape[0] == 1 and q.shape[0] > 1:
-            bias = bias.expand(q.shape[0], *bias.shape[1:])
+        if len(q.shape) == 3 and len(bias.shape) == 3:
+            bias = bias.expand(q.shape[0], *bias.shape)
 
         # Line 11: Multi-head attention with attention bias & gating (and optionally local attention)
         q = self.attention(q_x=q, kv_x=kv, attn_bias=bias, inplace_safe=inplace_safe)
