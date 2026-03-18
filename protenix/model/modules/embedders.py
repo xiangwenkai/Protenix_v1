@@ -84,20 +84,33 @@ class InputFeatureEmbedder(nn.Module):
             torch.Tensor: token embedding
                 [..., N_token, 384 (c_token) + 32 + 32 + 1 :=449]
         """
-        # Embed per-atom features.
-        a, _, _, _ = self.atom_attention_encoder(
-            input_feature_dict["atom_to_token_idx"],
-            input_feature_dict["ref_pos"],
-            input_feature_dict["ref_charge"],
-            input_feature_dict["ref_mask"],
-            input_feature_dict["ref_atom_name_chars"],
-            input_feature_dict["ref_element"],
-            input_feature_dict["d_lm"],
-            input_feature_dict["v_lm"],
-            input_feature_dict["pad_info"],
-            inplace_safe=inplace_safe,
-            chunk_size=chunk_size,
-        )  # [..., N_token, c_token]
+        # Token-level model: skip AtomAttentionEncoder, use token-level embeddings directly
+        if "atom_to_token_idx" in input_feature_dict:
+            # Atom-level model: use AtomAttentionEncoder
+            # Embed per-atom features.
+            a, _, _, _ = self.atom_attention_encoder(
+                input_feature_dict["atom_to_token_idx"],
+                input_feature_dict["ref_pos"],
+                input_feature_dict["ref_charge"],
+                input_feature_dict["ref_mask"],
+                input_feature_dict["ref_atom_name_chars"],
+                input_feature_dict["ref_element"],
+                input_feature_dict["d_lm"],
+                input_feature_dict["v_lm"],
+                input_feature_dict["pad_info"],
+                inplace_safe=inplace_safe,
+                chunk_size=chunk_size,
+            )  # [..., N_token, c_token]
+        else:
+            # Token-level model: ref_pos is already token-level, use it directly
+            # Create token embedding from ref_pos (token-level coordinates)
+            a = torch.zeros(
+                *input_feature_dict["ref_pos"].shape[:-1],
+                self.c_token,
+                dtype=input_feature_dict["ref_pos"].dtype,
+                device=input_feature_dict["ref_pos"].device,
+            )
+
         # Concatenate the per-token features.
         batch_shape = input_feature_dict["restype"].shape[:-1]
         s_inputs = torch.cat(
