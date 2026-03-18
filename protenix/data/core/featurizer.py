@@ -188,6 +188,7 @@ class Featurizer(object):
         lig_res_ref_conf_kdtree: dict[str, tuple[KDTree, list[int]]],
         ref_pos: torch.Tensor,
         ref_mask: torch.Tensor,
+        atom_to_token_idx: np.ndarray = None,
     ) -> tuple[int, list[int]]:
         """
         Ref: AlphaFold3 SI Chapter 4.3.2
@@ -196,25 +197,33 @@ class Featurizer(object):
         Args:
             token (Token): Token object.
             centre_atom (Atom): Biotite Atom object of Token centre atom.
-            lig_res_ref_conf_kdtree (Dict[str, Tuple[KDTree, List[int]]]): A dictionary of KDTree objects and atom indices.
-            ref_pos (torch.Tensor): Atom positions in the reference conformer. Size=[N_atom, 3]
-            ref_mask (torch.Tensor): Mask indicating which atom slots are used in the reference conformer. Size=[N_atom]
+            lig_res_ref_conf_kdtree (Dict[str, Tuple[KDTree, List[int]]]): A dictionary of KDTree objects and token indices (token-level in token-level model).
+            ref_pos (torch.Tensor): Atom positions in the reference conformer. Size=[N_token, 3] (token-level)
+            ref_mask (torch.Tensor): Mask indicating which atom slots are used in the reference conformer. Size=[N_token] (token-level)
+            atom_to_token_idx (np.ndarray): Mapping from atom-level to token-level indices. Required for token-level model.
 
         Returns:
             tuple[int, List[int]]:
                 has_frame (int): 1 if the token has frame, 0 otherwise.
-                frame_atom_index (List[int]): The index of the atoms used to construct the frame.
+                frame_atom_index (List[int]): The index of the atoms used to construct the frame (token-level in token-level model).
         """
-        kdtree, atom_ids = lig_res_ref_conf_kdtree[centre_atom.ref_space_uid]
-        b_ref_pos = ref_pos[token.centre_atom_index]
-        b_idx = token.centre_atom_index
+        kdtree, token_ids = lig_res_ref_conf_kdtree[centre_atom.ref_space_uid]
+
+        # Token-level: convert atom-level centre_atom_index to token-level
+        if atom_to_token_idx is not None:
+            b_idx = atom_to_token_idx[token.centre_atom_index]
+        else:
+            b_idx = token.centre_atom_index
+
+        b_ref_pos = ref_pos[b_idx]
+
         if kdtree is None:
             # Atom num < 3
             frame_atom_index = [-1, b_idx, -1]
             has_frame = 0
         else:
             _dist, ind = kdtree.query([b_ref_pos], k=3)
-            a_idx, c_idx = atom_ids[ind[0][1]], atom_ids[ind[0][2]]
+            a_idx, c_idx = token_ids[ind[0][1]], token_ids[ind[0][2]]
             frame_atom_index = [a_idx, b_idx, c_idx]
 
             # Check if reference confomrer vaild
@@ -318,7 +327,8 @@ class Featurizer(object):
 
             else:
                 has_frame, frame_atom_index = Featurizer.get_lig_frame(
-                    token, centre_atom, lig_res_ref_conf_kdtree, ref_pos, ref_mask
+                    token, centre_atom, lig_res_ref_conf_kdtree, ref_pos, ref_mask,
+                    atom_to_token_idx=atom_to_token_idx
                 )
 
             token.has_frame = has_frame
