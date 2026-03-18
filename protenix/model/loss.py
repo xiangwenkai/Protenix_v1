@@ -699,11 +699,9 @@ class PDELoss(nn.Module):
 
         # Compute label: the true bins
         # True distance
-        rep_atom_mask = rep_atom_mask.bool()
-        true_coordinate = true_coordinate[..., rep_atom_mask, :]  # [..., N_token, 3]
+        # rep_atom_mask = rep_atom_mask.bool()
         gt_dist = cdist(true_coordinate, true_coordinate)  # [..., N_token, N_token]
         # Predicted distance
-        pred_coordinate = pred_coordinate[..., rep_atom_mask, :]
         pred_dist = cdist(
             pred_coordinate, pred_coordinate
         )  # [..., N_sample, N_token, N_token]
@@ -719,8 +717,7 @@ class PDELoss(nn.Module):
         )  # just in case bin=0 occurs
 
         # Mask
-        token_mask = coordinate_mask[..., rep_atom_mask]
-        pair_mask = token_mask[..., None] * token_mask[..., None, :]
+        pair_mask = coordinate_mask[..., None] * coordinate_mask[..., None, :]
 
         return F.one_hot(true_bins - 1, self.no_bins).detach(), pair_mask.detach()
 
