@@ -19,7 +19,8 @@ from pathlib import Path
 
 from protenix.config.extend_types import GlobalConfigValue, ListValue
 
-PROTENIX_ROOT_DIR = os.environ.get("PROTENIX_ROOT_DIR", str(Path.home()))
+# PROTENIX_ROOT_DIR = os.environ.get("PROTENIX_ROOT_DIR", str(Path.home()))
+PROTENIX_ROOT_DIR = os.environ.get("PROTENIX_ROOT_DIR", "/inspire/ssd/project/sais-bio/public/Protein/data/AI_Models/protenix_v1_dataset")
 
 default_test_configs = {
     "sampler_configs": {
@@ -229,7 +230,7 @@ data_configs = {
         },
     },
     "template": {
-        "enable_prot_template": True,
+        "enable_prot_template": False,
         "template_dropout_rate": 0.0,
         "prot_template_mmcif_dir": os.path.join(PROTENIX_ROOT_DIR, "mmcif"),
         "prot_template_cache_dir": "",

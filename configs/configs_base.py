@@ -255,26 +255,26 @@ model_configs = {
             "hidden_scale_up": GlobalConfigValue("hidden_scale_up"),
         },
         "diffusion_module": {
-            "use_fine_grained_checkpoint": True,
+            # "use_fine_grained_checkpoint": True,
             "sigma_data": GlobalConfigValue("sigma_data"),
             "c_token": 768,
-            "c_atom": GlobalConfigValue("c_atom"),
-            "c_atompair": GlobalConfigValue("c_atompair"),
+            # "c_atom": GlobalConfigValue("c_atom"),
+            # "c_atompair": GlobalConfigValue("c_atompair"),
             "c_z": GlobalConfigValue("c_z"),
             "c_s": GlobalConfigValue("c_s"),
             "c_s_inputs": GlobalConfigValue("c_s_inputs"),
-            "atom_encoder": {
-                "n_blocks": 3,
-                "n_heads": 4,
-            },
+            # "atom_encoder": {
+            #     "n_blocks": 3,
+            #     "n_heads": 4,
+            # },
             "transformer": {
                 "n_blocks": 24,
                 "n_heads": 16,
             },
-            "atom_decoder": {
-                "n_blocks": 3,
-                "n_heads": 4,
-            },
+            # "atom_decoder": {
+            #     "n_blocks": 3,
+            #     "n_heads": 4,
+            # },
             "blocks_per_ckpt": GlobalConfigValue("blocks_per_ckpt"),
         },
         "confidence_head": {
