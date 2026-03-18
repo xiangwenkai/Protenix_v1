@@ -870,7 +870,7 @@ class PAELoss(nn.Module):
         """
 
         coordinate_mask = coordinate_mask.bool()
-        rep_atom_mask = rep_atom_mask.bool()
+        # rep_atom_mask = rep_atom_mask.bool()
         has_frame = has_frame.bool()
 
         # NOTE: to support frame_atom_index with batch_dims, need to expand its dims before constructing frames.
@@ -894,15 +894,14 @@ class PAELoss(nn.Module):
         true_frame_coord_mask = (
             true_frame_coord_mask.sum(dim=-1) >= 3
         )  # [N_frame] whether all atoms in the frame has coordinates
-        token_mask = coordinate_mask[rep_atom_mask]  # [N_token]
         frame_token_pair_mask = (
-            true_frame_coord_mask[..., None] * token_mask[..., None, :]
+            true_frame_coord_mask[..., None] * coordinate_mask[..., None, :]
         )  # [N_frame, N_token]
 
         squared_pae = (
             compute_alignment_error_squared(
-                pred_coordinate=pred_coordinate[..., rep_atom_mask, :],
-                true_coordinate=true_coordinate[..., rep_atom_mask, :],
+                pred_coordinate=pred_coordinate,
+                true_coordinate=true_coordinate,
                 pred_frames=pred_frames,
                 true_frames=true_frames,
             )
