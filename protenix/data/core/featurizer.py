@@ -683,9 +683,23 @@ class Featurizer(object):
         for i, j, _ in lig_polymer_bonds:
             bond_mask_mat[i, j] = 1
             bond_mask_mat[j, i] = 1
+
+        # Token-level: convert atom-level bond_mask to token-level
+        # For each pair of tokens, mark as bonded if any atoms in those tokens are bonded
+        rep_mask = self.cropped_atom_array.distogram_rep_atom_mask.astype(bool)
+        rep_atom_indices = np.where(rep_mask)[0]  # indices of representative atoms
+        n_token = len(rep_atom_indices)
+
+        token_bond_mask_mat = np.zeros((n_token, n_token))
+        for i, atom_i in enumerate(rep_atom_indices):
+            for j, atom_j in enumerate(rep_atom_indices):
+                # Check if there's any bond between atoms in token i and token j
+                if bond_mask_mat[atom_i, atom_j] > 0:
+                    token_bond_mask_mat[i, j] = 1
+
         mask_features["bond_mask"] = torch.Tensor(
-            bond_mask_mat
-        ).long()  # [N_atom, N_atom]
+            token_bond_mask_mat
+        ).long()  # [N_token, N_token]
         return mask_features
 
     def get_all_input_features(self):
