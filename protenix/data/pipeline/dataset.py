@@ -523,7 +523,7 @@ class BaseSingleDataset(Dataset):
             ),
             "N_asym": torch.tensor([len(torch.unique(feat["asym_id"]))]),
             "N_token": torch.tensor([feat["token_index"].shape[0]]),
-            "N_atom": torch.tensor([feat["atom_to_token_idx"].shape[0]]),
+            "N_atom": torch.tensor([feat["token_index"].shape[0]]),
             "N_msa": torch.tensor([feat["msa"].shape[0]]),
             "bioassembly_dict_fpath": bioassembly_dict_fpath,
             "N_msa_prot_pair": torch.tensor([feat["prot_pair_num_alignments"]]),
@@ -537,7 +537,7 @@ class BaseSingleDataset(Dataset):
             abbr_type = abbr.get(mol_type, mol_type)
             mol_type_mask = feat[f"is_{mol_type}"].bool()
             n_atom = int(mol_type_mask.sum(dim=-1).item())
-            n_token = len(torch.unique(feat["atom_to_token_idx"][mol_type_mask]))
+            n_token = len(torch.unique(feat["token_index"][mol_type_mask]))
             basic_info[f"N_{abbr_type}_atom"] = torch.tensor([n_atom])
             basic_info[f"N_{abbr_type}_token"] = torch.tensor([n_token])
 
