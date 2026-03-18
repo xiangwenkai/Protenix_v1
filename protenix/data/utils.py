@@ -965,7 +965,11 @@ def make_dummy_feature(
     dummy_feats: Sequence = ["msa"],
 ) -> dict[str, torch.Tensor]:
     num_token = features_dict["token_index"].shape[0]
-    num_atom = features_dict["atom_to_token_idx"].shape[0]
+    # Token-level model: atom_to_token_idx is removed, so num_atom = num_token
+    if "atom_to_token_idx" in features_dict:
+        num_atom = features_dict["atom_to_token_idx"].shape[0]
+    else:
+        num_atom = num_token
     num_msa = 1
     num_templ = 4
     num_pockets = 30
