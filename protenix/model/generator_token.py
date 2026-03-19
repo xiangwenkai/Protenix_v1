@@ -214,9 +214,9 @@ def sample_token_diffusion_training(
 
     def _chunk_denoise(chunk_n_sample):
         # Sample noise levels
-        noise_level_chunk = noise_sampler.sample(
-            size=(*batch_shape, chunk_n_sample), device=device, dtype=dtype
-        )
+        noise_level_chunk = noise_sampler(
+            size=(*batch_shape, chunk_n_sample), device=device
+        ).to(dtype)
 
         # Add noise to ground truth
         noise = torch.randn(
