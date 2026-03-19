@@ -28,6 +28,7 @@ from protenix.model.modules.embedders import FourierEmbedding, RelativePositionE
 from protenix.model.modules.primitives import LinearNoBias, Transition
 from protenix.model.modules.transformer import DiffusionTransformer
 from protenix.model.triangular.layers import LayerNorm
+from protenix.model.utils import get_checkpoint_fn
 
 
 class TokenDiffusionConditioning(nn.Module):
@@ -272,16 +273,35 @@ class TokenDiffusionModule(nn.Module):
         assert t_hat_noise_level.size(-1) == N_sample
 
         # Conditioning
-        s_single, z_pair = self.diffusion_conditioning(
-            t_hat_noise_level,
-            input_feature_dict["relp"],
-            s_inputs=s_inputs,
-            s_trunk=s_trunk,
-            z_trunk=z_trunk,
-            pair_z=pair_z,
-            inplace_safe=inplace_safe,
-            use_conditioning=use_conditioning,
-        )  # s_single: [..., N_sample, N_token, c_s], z_pair: [..., N_token, N_token, c_z]
+        blocks_per_ckpt = self.blocks_per_ckpt
+        if not torch.is_grad_enabled():
+            blocks_per_ckpt = None
+
+        if blocks_per_ckpt:
+            checkpoint_fn = get_checkpoint_fn()
+            s_single, z_pair = checkpoint_fn(
+                self.diffusion_conditioning,
+                t_hat_noise_level,
+                input_feature_dict["relp"],
+                s_inputs,
+                s_trunk,
+                z_trunk,
+                pair_z,
+                inplace_safe,
+                use_conditioning,
+            )
+        else:
+            s_single, z_pair = self.diffusion_conditioning(
+                t_hat_noise_level,
+                input_feature_dict["relp"],
+                s_inputs=s_inputs,
+                s_trunk=s_trunk,
+                z_trunk=z_trunk,
+                pair_z=pair_z,
+                inplace_safe=inplace_safe,
+                use_conditioning=use_conditioning,
+            )
+        # s_single: [..., N_sample, N_token, c_s], z_pair: [..., N_token, N_token, c_z]
 
         # 将token坐标编码为特征
         a_token = self.coord_to_token(r_noisy)  # [..., N_sample, N_token, c_token]
