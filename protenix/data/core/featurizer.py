@@ -149,36 +149,39 @@ class Featurizer(object):
         return onehot_tensor
 
     @staticmethod
-    def get_prot_nuc_frame(token: Token, centre_atom: Atom) -> tuple[int, list[int]]:
+    def get_prot_nuc_frame(
+        token_idx: int, chain_start: int, chain_end: int
+    ) -> tuple[int, list[int]]:
         """
-        Ref: AlphaFold3 SI Chapter 4.3.2
-        For proteins/DNA/RNA, we use the three atoms [N, CA, C] / [C1', C3', C4']
+        Token-level frame for proteins/DNA/RNA.
+        Uses neighbouring token indices [i-1, i, i+1] as the three frame points.
+        For the first two tokens of a chain, uses [chain_start, chain_start+1, chain_start+2].
+        For the last two tokens of a chain, uses [chain_end-2, chain_end-1, chain_end].
 
         Args:
-            token (Token): Token object.
-            centre_atom (Atom): Biotite Atom object of Token centre atom.
+            token_idx (int): Token-level index of the current token.
+            chain_start (int): Token-level index of the first token in this chain.
+            chain_end (int): Token-level index of the last token in this chain (inclusive).
 
         Returns:
             has_frame (int): 1 if the token has frame, 0 otherwise.
-            frame_atom_index (List[int]): The index of the atoms used to construct the frame.
+            frame_atom_index (List[int]): Token-level indices [a, b, c] for the frame.
         """
-        if centre_atom.mol_type == "protein":
-            # For protein
-            abc_atom_name = ["N", "CA", "C"]
-        else:
-            # For DNA and RNA
-            abc_atom_name = [r"C1'", r"C3'", r"C4'"]
+        chain_len = chain_end - chain_start + 1
+        if chain_len < 3:
+            # Cannot form a valid frame with fewer than 3 tokens
+            return 0, [-1, -1, -1]
 
-        idx_in_atom_indices = []
-        for i in abc_atom_name:
-            if centre_atom.mol_type == "protein" and "N" not in token.atom_names:
-                return 0, [-1, -1, -1]
-            elif centre_atom.mol_type != "protein" and "C1'" not in token.atom_names:
-                return 0, [-1, -1, -1]
-            idx_in_atom_indices.append(token.atom_names.index(i))
-        # Protein/DNA/RNA always has frame
+        if token_idx <= chain_start + 1:
+            # First or second token: use [0, 1, 2] of the chain
+            frame_atom_index = [chain_start, chain_start + 1, chain_start + 2]
+        elif token_idx >= chain_end - 1:
+            # Last or second-to-last token: use [-3, -2, -1] of the chain
+            frame_atom_index = [chain_end - 2, chain_end - 1, chain_end]
+        else:
+            frame_atom_index = [token_idx - 1, token_idx, token_idx + 1]
+
         has_frame = 1
-        frame_atom_index = [token.atom_indices[i] for i in idx_in_atom_indices]
         return has_frame, frame_atom_index
 
     @staticmethod
@@ -313,18 +316,30 @@ class Featurizer(object):
                 kdtree = None
             lig_res_ref_conf_kdtree[ref_space_uid] = (kdtree, valid_token_ids)
 
+        # Pre-compute per-chain token ranges for neighbour-based frame construction
+        # Group token indices by (asym_id_int, mol_type) so chains are separated
+        chain_token_ranges = {}  # key: (asym_id_int, mol_type) -> (chain_start, chain_end)
+        for tok_idx, token in enumerate(token_array_w_frame):
+            centre_atom = atom_array[token.centre_atom_index]
+            if centre_atom.mol_type in ("protein", "dna", "rna"):
+                key = (centre_atom.asym_id_int, centre_atom.mol_type)
+                if key not in chain_token_ranges:
+                    chain_token_ranges[key] = [tok_idx, tok_idx]
+                else:
+                    chain_token_ranges[key][1] = tok_idx
+
         has_frame = []
-        for token in token_array_w_frame:
+        for tok_idx, token in enumerate(token_array_w_frame):
             centre_atom = atom_array[token.centre_atom_index]
             if (
                 centre_atom.mol_type != "ligand"
                 and centre_atom.res_name in STD_RESIDUES
-                and len(token.atom_indices) > 1
             ):
+                key = (centre_atom.asym_id_int, centre_atom.mol_type)
+                chain_start, chain_end = chain_token_ranges[key]
                 has_frame, frame_atom_index = Featurizer.get_prot_nuc_frame(
-                    token, centre_atom
+                    tok_idx, chain_start, chain_end
                 )
-
             else:
                 has_frame, frame_atom_index = Featurizer.get_lig_frame(
                     token, centre_atom, lig_res_ref_conf_kdtree, ref_pos, ref_mask,
