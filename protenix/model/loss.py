@@ -576,8 +576,8 @@ class DistogramLoss(nn.Module):
 
         # Compute label: the true bins
         # True distance
-        rep_atom_mask = rep_atom_mask.bool()
-        true_coordinate = true_coordinate[..., rep_atom_mask, :]  # [..., N_token, 3]
+        # rep_atom_mask = rep_atom_mask.bool()
+        # true_coordinate = true_coordinate[..., rep_atom_mask, :]  # [..., N_token, 3]
         gt_dist = cdist(true_coordinate, true_coordinate)  # [..., N_token, N_token]
         # Assign distance to bins
         true_bins = torch.sum(
@@ -585,8 +585,7 @@ class DistogramLoss(nn.Module):
         )  # range in [0, no_bins-1], shape = [..., N_token, N_token]
 
         # Mask
-        token_mask = coordinate_mask[..., rep_atom_mask]
-        pair_mask = token_mask[..., None] * token_mask[..., None, :]
+        pair_mask = coordinate_mask[..., None] * coordinate_mask[..., None, :]
 
         return F.one_hot(true_bins, self.no_bins), pair_mask
 
