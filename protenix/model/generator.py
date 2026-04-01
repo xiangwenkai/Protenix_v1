@@ -17,6 +17,7 @@ from typing import Any, Callable, Optional
 import torch
 
 from protenix.model.utils import centre_random_augmentation
+from protenix.model.diversity_sampler import DiversitySampler
 
 
 class TrainingNoiseSampler:
@@ -135,8 +136,9 @@ def sample_diffusion(
     inplace_safe: bool = False,
     attn_chunk_size: Optional[int] = None,
     enable_efficient_fusion: bool = False,
+    diversity_sampler: Optional[DiversitySampler] = None,
 ) -> torch.Tensor:
-    """Implements Algorithm 18 in AF3.
+    """Implements Algorithm 18 in AF3 with optional diversity bias injection.
     It performances denoising steps from time 0 to time T.
     The time steps (=noise levels) are given by noise_schedule.
 
@@ -166,6 +168,7 @@ def sample_diffusion(
         inplace_safe (bool): Whether to use inplace operations safely. Defaults to False.
         attn_chunk_size (Optional[int]): Chunk size for attention operation. Defaults to None.
         enable_efficient_fusion (bool): Whether to enable efficient fusion. Defaults to False.
+        diversity_sampler (Optional[DiversitySampler]): Sampler for injecting repulsive bias. Defaults to None.
 
     Returns:
         torch.Tensor: the denoised coordinates of x in inference stage
@@ -230,7 +233,18 @@ def sample_diffusion(
                 ..., None, None
             ]  # Line 9 of AF3 uses 'x_l_hat' instead, which we believe  is a typo.
             dt = c_tau - t_hat
-            x_l = x_noisy + step_scale_eta * dt[..., None, None] * delta
+            x_l_updated = x_noisy + step_scale_eta * dt[..., None, None] * delta
+
+            # Inject diversity bias if sampler is provided
+            if diversity_sampler is not None:
+                bias = diversity_sampler.compute_bias(
+                    x=x_l_updated,
+                    noise_level=float(c_tau),
+                    atom_to_token_idx=input_feature_dict["atom_to_token_idx"],
+                )
+                x_l = x_l_updated + bias if bias is not None else x_l_updated
+            else:
+                x_l = x_l_updated
 
         return x_l
 
@@ -252,6 +266,12 @@ def sample_diffusion(
             )
             x_l.append(chunk_x_l)
         x_l = torch.cat(x_l, -3)  # [..., N_sample, N_atom, 3]
+
+    # Add final structures to diversity sampler bank
+    if diversity_sampler is not None:
+        for i in range(x_l.shape[-3]):
+            diversity_sampler.add_structure(x_l[..., i, :, :])
+
     return x_l
 
 
