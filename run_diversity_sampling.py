@@ -28,10 +28,16 @@ class DiversitySamplingRunner:
     def __init__(self, configs: Any):
         self.configs = configs
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = Protenix.from_pretrained(configs.checkpoint_path)
+
+        # Initialize model with configs
+        self.model = Protenix(configs)
         self.model = self.model.to(self.device)
+
+        # Load checkpoint
+        checkpoint = torch.load(configs.checkpoint_path, map_location=self.device, weights_only=False)
+        self.model.load_state_dict(checkpoint)
         self.model.eval()
-        logger.info(f"Model loaded on {self.device}")
+        logger.info(f"Model loaded from {configs.checkpoint_path} on {self.device}")
 
     @torch.no_grad()
     def predict(self, data: dict) -> dict:
@@ -153,3 +159,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# example
+# python run_diversity_sampling.py --input_json examples/casp/input_json/8VVJ.json --checkpoint_path checkpoint/protenix_base_default_v1.0.0.pt --rounds 3 --samples 1 --output_dir examples/diversity
