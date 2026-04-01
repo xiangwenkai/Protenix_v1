@@ -135,7 +135,7 @@ def main():
 
     args = parser.parse_args()
 
-    # Build configs like inference.py
+    # Build minimal configs for inference only
     base_configs = {**configs_base, **{"data": data_configs}, **inference_configs}
     model_specifics = model_configs.get(args.model_name, {})
 
@@ -149,13 +149,21 @@ def main():
 
     deep_update(base_configs, model_specifics)
 
-    # Parse configs
-    arg_str = f"--checkpoint_path {args.checkpoint_path} --input_json_path {args.input_json} --output_dir {args.output_dir}"
-    configs = parse_configs(
-        configs=base_configs,
-        arg_str=arg_str,
-        fill_required_with_null=False,
-    )
+    # Manually set required fields to avoid parse_configs validation
+    base_configs["checkpoint_path"] = args.checkpoint_path
+    base_configs["input_json_path"] = args.input_json
+    base_configs["output_dir"] = args.output_dir
+
+    # Create config object directly
+    class Config:
+        def __init__(self, d):
+            for k, v in d.items():
+                if isinstance(v, dict):
+                    setattr(self, k, Config(v))
+                else:
+                    setattr(self, k, v)
+
+    configs = Config(base_configs)
 
     logger.info(f"Using model: {args.model_name}")
 
