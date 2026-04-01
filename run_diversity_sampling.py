@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Diversity sampling script following runner/inference.py structure.
+Saves samples in both PT and CIF formats.
 Usage: python run_diversity_sampling.py --input_json input.json --checkpoint model.pt --rounds 3 --samples 4
 """
 
@@ -12,6 +13,7 @@ from typing import Any
 
 from protenix.config.config import parse_configs, parse_sys_args
 from protenix.data.inference.infer_dataloader import get_inference_dataloader
+from protenix.data.utils import save_structure_cif
 from protenix.model.protenix import Protenix
 from protenix.model.diversity_sampler import DiversitySampler
 from protenix.utils.distributed import DIST_WRAPPER
@@ -58,6 +60,11 @@ class DiversitySamplingRunner:
         for batch_idx, batch_data in enumerate(dataloader):
             logger.info(f"\n=== Processing batch {batch_idx + 1} ===")
 
+            # Extract atom_array and entity_poly_type from batch
+            atom_array = batch_data.get("atom_array")
+            entity_poly_type = batch_data.get("entity_poly_type", {})
+            pdb_id = batch_data.get("pdb_id", f"batch_{batch_idx}")
+
             for round_idx in range(num_rounds):
                 logger.info(f"Round {round_idx + 1}/{num_rounds}")
 
@@ -70,13 +77,33 @@ class DiversitySamplingRunner:
                     for i in range(min(samples_per_round, x_samples.shape[0])):
                         sample = x_samples[i].cpu()
                         all_samples.append(sample)
-                        logger.info(f"  Sample {i + 1}: {sample.shape}")
+
+                        sample_idx = len(all_samples) - 1
+
+                        # Save as PT
+                        pt_path = output_dir / f"sample_{sample_idx:03d}.pt"
+                        torch.save(sample, pt_path)
+
+                        # Save as CIF if atom_array available
+                        if atom_array is not None:
+                            cif_path = output_dir / f"sample_{sample_idx:03d}.cif"
+                            try:
+                                save_structure_cif(
+                                    atom_array=atom_array,
+                                    pred_coordinate=sample,
+                                    output_fpath=str(cif_path),
+                                    entity_poly_type=entity_poly_type,
+                                    pdb_id=pdb_id,
+                                )
+                                logger.info(f"  Sample {i + 1}: {sample.shape} -> {cif_path}")
+                            except Exception as e:
+                                logger.warning(f"Failed to save CIF: {e}")
+                                logger.info(f"  Sample {i + 1}: {sample.shape} -> {pt_path}")
+                        else:
+                            logger.info(f"  Sample {i + 1}: {sample.shape} -> {pt_path}")
 
                 logger.info(f"  Bank size: {len(diversity_sampler.structure_bank)}")
 
-        # Save results
-        for i, sample in enumerate(all_samples):
-            torch.save(sample, output_dir / f"sample_{i:03d}.pt")
         logger.info(f"\nSaved {len(all_samples)} samples to {output_dir}")
 
 
