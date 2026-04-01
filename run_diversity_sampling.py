@@ -2,21 +2,23 @@
 """
 Diversity sampling script following runner/inference.py structure.
 Saves samples in both PT and CIF formats.
-Usage: python run_diversity_sampling.py --input_json input.json --checkpoint model.pt --rounds 3 --samples 4
+Usage: python run_diversity_sampling.py --input_json input.json --checkpoint_path model.pt --rounds 3 --samples 4
 """
 
 import json
 import logging
 import torch
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
+from configs.configs_base import configs as configs_base
+from configs.configs_data import data_configs
+from configs.configs_inference import inference_configs
+from configs.configs_model_type import model_configs
 from protenix.config.config import parse_configs, parse_sys_args
-from protenix.data.inference.infer_dataloader import get_inference_dataloader
 from protenix.data.utils import save_structure_cif
 from protenix.model.protenix import Protenix
 from protenix.model.diversity_sampler import DiversitySampler
-from protenix.utils.distributed import DIST_WRAPPER
 from protenix.utils.torch_utils import to_device
 
 logger = logging.getLogger(__name__)
@@ -34,10 +36,11 @@ class DiversitySamplingRunner:
         self.model = self.model.to(self.device)
 
         # Load checkpoint
-        checkpoint = torch.load(configs.checkpoint_path, map_location=self.device, weights_only=False)
+        checkpoint_path = configs.checkpoint_path
+        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
         self.model.load_state_dict(checkpoint)
         self.model.eval()
-        logger.info(f"Model loaded from {configs.checkpoint_path} on {self.device}")
+        logger.info(f"Model loaded from {checkpoint_path} on {self.device}")
 
     @torch.no_grad()
     def predict(self, data: dict) -> dict:
@@ -128,17 +131,35 @@ def main():
     parser.add_argument("--rounds", type=int, default=3, help="Sampling rounds")
     parser.add_argument("--samples", type=int, default=4, help="Samples per round")
     parser.add_argument("--output_dir", default="outputs", help="Output directory")
+    parser.add_argument("--model_name", default="protenix_base_default_v1.0.0", help="Model name")
 
     args = parser.parse_args()
 
-    # Create minimal config
-    configs = type("Config", (), {
-        "input_json_path": args.input_json,
-        "checkpoint_path": args.checkpoint_path,
-        "output_dir": args.output_dir,
-    })()
+    # Build configs like inference.py
+    base_configs = {**configs_base, **{"data": data_configs}, **inference_configs}
+    model_specifics = model_configs.get(args.model_name, {})
 
-    # Load dataloader
+    def deep_update(d, u):
+        for k, v in u.items():
+            if isinstance(v, Mapping) and k in d and isinstance(d[k], Mapping):
+                deep_update(d[k], v)
+            else:
+                d[k] = v
+        return d
+
+    deep_update(base_configs, model_specifics)
+
+    # Parse configs
+    arg_str = f"--checkpoint_path {args.checkpoint_path} --input_json_path {args.input_json} --output_dir {args.output_dir}"
+    configs = parse_configs(
+        configs=base_configs,
+        arg_str=arg_str,
+        fill_required_with_null=False,
+    )
+
+    logger.info(f"Using model: {args.model_name}")
+
+    # Load data
     logger.info(f"Loading data from {args.input_json}")
     with open(args.input_json) as f:
         json_data = json.load(f)
