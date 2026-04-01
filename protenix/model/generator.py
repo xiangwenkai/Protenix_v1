@@ -267,11 +267,6 @@ def sample_diffusion(
             x_l.append(chunk_x_l)
         x_l = torch.cat(x_l, -3)  # [..., N_sample, N_atom, 3]
 
-    # Add final structures to diversity sampler bank
-    if diversity_sampler is not None:
-        for i in range(x_l.shape[-3]):
-            diversity_sampler.add_structure(x_l[..., i, :, :])
-
     return x_l
 
 

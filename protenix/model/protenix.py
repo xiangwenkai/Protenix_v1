@@ -357,6 +357,7 @@ class Protenix(nn.Module):
         N_model_seed: int = 1,
         symmetric_permutation: SymmetricPermutation = None,
         mc_dropout_apply_rate: float = 0.4,
+        diversity_sampler = None
     ) -> tuple[dict[str, torch.Tensor], dict[str, Any], dict[str, Any]]:
         """
         Main inference loop (multiple model seeds) for the Alphafold3 model.
@@ -395,6 +396,7 @@ class Protenix(nn.Module):
                     chunk_size=chunk_size,
                     symmetric_permutation=symmetric_permutation,
                     mc_dropout=random.random() < mc_dropout_apply_rate,
+                    diversity_sampler=diversity_sampler
                 )
                 pred_dicts.append(pred_dict)
                 log_dicts.append(log_dict)
@@ -431,6 +433,7 @@ class Protenix(nn.Module):
                 chunk_size=chunk_size,
                 symmetric_permutation=symmetric_permutation,
                 mc_dropout=random.random() < mc_dropout_apply_rate,
+                diversity_sampler=diversity_sampler
             )
 
     def _get_dynamic_chunk_size(self, N_token: int) -> Optional[int]:
@@ -470,6 +473,7 @@ class Protenix(nn.Module):
         chunk_size: Optional[int] = 4,
         symmetric_permutation: SymmetricPermutation = None,
         mc_dropout: bool = False,
+        diversity_sampler = None
     ) -> tuple[dict[str, torch.Tensor], dict[str, Any], dict[str, Any]]:
         """
         Main inference loop (single model seed) for the Alphafold3 model.
@@ -565,6 +569,7 @@ class Protenix(nn.Module):
             noise_schedule=noise_schedule,
             inplace_safe=inplace_safe,
             enable_efficient_fusion=self.enable_efficient_fusion,
+            diversity_sampler = diversity_sampler
         )
 
         step_diffusion = time.time()
@@ -850,6 +855,7 @@ class Protenix(nn.Module):
         symmetric_permutation: SymmetricPermutation = None,
         disable_inplace: bool = False,
         mc_dropout_apply_rate: float = 0.4,
+        diversity_sampler = None
     ) -> tuple[dict[str, torch.Tensor], dict[str, Any], dict[str, Any]]:
         """
         Forward pass of the Alphafold3 model.
@@ -904,6 +910,7 @@ class Protenix(nn.Module):
                 N_model_seed=self.N_model_seed,
                 symmetric_permutation=None,
                 mc_dropout_apply_rate=mc_dropout_apply_rate,
+                diversity_sampler = diversity_sampler
             )
             log_dict.update({"time": time_tracker})
         elif mode == "eval":

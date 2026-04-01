@@ -67,13 +67,13 @@ class DiversitySampler:
             Rotation matrix [..., 3, 3]
         """
         # Compute covariance matrix: H = x_ref^T @ x / N
-        H = torch.einsum("...ji,...j->...ij", x_ref_centered, x_centered) / x_centered.shape[-2]
+        H = torch.einsum("...ni,...nj->...ij", x_ref_centered, x_centered) / x_centered.shape[-2]
 
         # SVD decomposition
         U, _, Vt = torch.linalg.svd(H)
 
         # Rotation: R = U @ V^T
-        R = torch.einsum("...ij,...jk->...ik", U, Vt)
+        R = torch.einsum("...ij,...kj->...ik", U, Vt)
 
         # Ensure proper rotation (det(R) = 1, not reflection)
         det = torch.linalg.det(R)

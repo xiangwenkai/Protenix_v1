@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 """
-Diversity sampling script following runner/inference.py structure.
-Saves samples in both PT and CIF formats.
-Usage: python run_diversity_sampling.py --input_json input.json --checkpoint_path model.pt --rounds 3 --samples 4
+Diversity sampling script - uses inference.py approach.
+Usage: python run_diversity_sampling.py --input_json input.json --checkpoint_path model.pt --rounds 3 --samples 1
 """
 
 import json
+import copy
 import logging
 import torch
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 from configs.configs_base import configs as configs_base
 from configs.configs_data import data_configs
 from configs.configs_inference import inference_configs
 from configs.configs_model_type import model_configs
-from protenix.config.config import parse_configs, parse_sys_args
+from protenix.data.inference.infer_dataloader import get_inference_dataloader
 from protenix.data.utils import save_structure_cif
 from protenix.model.protenix import Protenix
 from protenix.model.diversity_sampler import DiversitySampler
@@ -27,23 +27,63 @@ logger = logging.getLogger(__name__)
 class DiversitySamplingRunner:
     """Runner for diversity sampling with bias injection."""
 
-    def __init__(self, configs: Any):
-        self.configs = configs
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    def __init__(self, checkpoint_path: str, model_name: str = "protenix_base_default_v1.0.0", device: str = "cuda"):
+        self.device = torch.device(device if torch.cuda.is_available() else "cpu")
 
-        # Initialize model with configs
+        # Build configs exactly like inference.py
+        base_configs = {**configs_base, **{"data": data_configs}, **inference_configs}
+        model_specifics = model_configs.get(model_name, {})
+
+        def deep_update(d, u):
+            for k, v in u.items():
+                if isinstance(v, dict) and k in d and isinstance(d[k], dict):
+                    deep_update(d[k], v)
+                else:
+                    d[k] = v
+            return d
+
+        deep_update(base_configs, model_specifics)
+
+        # Set checkpoint path in configs before parse_configs
+        base_configs["load_checkpoint_dir"] = str(Path(checkpoint_path).parent)
+        base_configs["model_name"] = model_name
+
+        # Use parse_configs like inference.py (without checkpoint_path arg)
+        from protenix.config.config import parse_configs
+        arg_str = ""  # No additional args needed
+        configs = parse_configs(
+            configs=base_configs,
+            arg_str=arg_str,
+            fill_required_with_null=True,
+        )
+
+        # Initialize model
+        logger.info(f"Initializing model: {model_name}")
         self.model = Protenix(configs)
         self.model = self.model.to(self.device)
 
-        # Load checkpoint
-        checkpoint_path = configs.checkpoint_path
-        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
-        self.model.load_state_dict(checkpoint)
+        # Load checkpoint weights
+        logger.info(f"Loading checkpoint from {checkpoint_path}")
+        checkpoint = torch.load(
+            checkpoint_path, map_location=self.device, weights_only=False
+        )
+
+        sample_key = list(checkpoint["model"].keys())[0]
+        print(f"Sampled key: {sample_key}")
+        if sample_key.startswith("module."):  # DDP checkpoint has module. prefix
+            checkpoint["model"] = {
+                k[len("module.") :]: v for k, v in checkpoint["model"].items()
+            }
+
+        self.model.load_state_dict(
+            state_dict=checkpoint["model"],
+            strict=False
+        )
         self.model.eval()
-        logger.info(f"Model loaded from {checkpoint_path} on {self.device}")
+        logger.info(f"Model loaded on {self.device}")
 
     @torch.no_grad()
-    def predict(self, data: dict) -> dict:
+    def predict(self, data: dict, diversity_sampler=None) -> dict:
         """Run model prediction."""
         data = to_device(data, self.device)
         prediction, _, _ = self.model(
@@ -51,51 +91,62 @@ class DiversitySamplingRunner:
             label_full_dict=None,
             label_dict=None,
             mode="inference",
+            diversity_sampler=diversity_sampler,
         )
         return prediction
 
-    def run_diversity_sampling(self, dataloader, num_rounds: int, samples_per_round: int):
-        """Run multi-round diversity sampling."""
+    def run_diversity_sampling(self, dataloader, num_rounds: int, samples_per_round: int, output_dir: str = "outputs",
+                               bias_weight: float = 1.0, bias_sigma: float = 2.0, bias_n_smooth: int = 1, bias_tmin: float = 0.0):
+        """Run multi-round diversity sampling.
+
+        Args:
+            bias_weight: Strength of biasing potential (higher = more diversity)
+            bias_sigma: Width of Gaussian potential (higher = gentler repulsion)
+            bias_n_smooth: Number of neighbors for smoothing (higher = smoother)
+            bias_tmin: Minimum noise level for bias injection
+        """
         diversity_sampler = DiversitySampler(
-            weight=1.0,
-            sigma=2.0,
-            n_smooth=1,
+            weight=bias_weight,
+            sigma=bias_sigma,
+            n_smooth=bias_n_smooth,
+            bias_tmin=bias_tmin,
         )
 
         all_samples = []
-        output_dir = Path("outputs")
-        output_dir.mkdir(exist_ok=True)
+        output_path = Path(output_dir)
+        output_path.mkdir(exist_ok=True, parents=True)
 
         for batch_idx, batch_data in enumerate(dataloader):
             logger.info(f"\n=== Processing batch {batch_idx + 1} ===")
 
-            # Extract atom_array and entity_poly_type from batch
-            atom_array = batch_data.get("atom_array")
-            entity_poly_type = batch_data.get("entity_poly_type", {})
-            pdb_id = batch_data.get("pdb_id", f"batch_{batch_idx}")
+            # Extract batch and atom_array
+            batch = batch_data[0][0]
+            atom_array = batch_data[0][1]
+            entity_poly_type = batch.get("entity_poly_type", {})
+            pdb_id = batch.get("pdb_id", f"batch_{batch_idx}")
+
+            # Cache batch for reuse across rounds
 
             for round_idx in range(num_rounds):
                 logger.info(f"Round {round_idx + 1}/{num_rounds}")
-
+                batch = copy.deepcopy(batch_data[0][0])
                 with torch.no_grad():
-                    prediction = self.predict(batch_data)
+                    # Use cached batch to avoid missing keys
+                    prediction = self.predict(batch, diversity_sampler=diversity_sampler)
 
                 # Extract samples
-                if "diffusion_samples" in prediction:
-                    x_samples = prediction["diffusion_samples"]["atom_positions"]
+                if prediction is not None:
+                    x_samples = prediction["coordinate"]
                     for i in range(min(samples_per_round, x_samples.shape[0])):
+                        diversity_sampler.add_structure(x_samples[i])
                         sample = x_samples[i].cpu()
                         all_samples.append(sample)
 
                         sample_idx = len(all_samples) - 1
 
-                        # Save as PT
-                        pt_path = output_dir / f"sample_{sample_idx:03d}.pt"
-                        torch.save(sample, pt_path)
-
                         # Save as CIF if atom_array available
                         if atom_array is not None:
-                            cif_path = output_dir / f"sample_{sample_idx:03d}.cif"
+                            cif_path = output_path / f"sample_{sample_idx:03d}.cif"
                             try:
                                 save_structure_cif(
                                     atom_array=atom_array,
@@ -113,7 +164,7 @@ class DiversitySamplingRunner:
 
                 logger.info(f"  Bank size: {len(diversity_sampler.structure_bank)}")
 
-        logger.info(f"\nSaved {len(all_samples)} samples to {output_dir}")
+        logger.info(f"\nSaved {len(all_samples)} samples to {output_path}")
 
 
 def main():
@@ -132,62 +183,56 @@ def main():
     parser.add_argument("--samples", type=int, default=4, help="Samples per round")
     parser.add_argument("--output_dir", default="outputs", help="Output directory")
     parser.add_argument("--model_name", default="protenix_base_default_v1.0.0", help="Model name")
+    parser.add_argument("--device", default="cuda", help="Device (cuda/cpu)")
+    parser.add_argument("--bias_weight", type=float, default=1.0, help="Bias strength (higher = more diversity)")
+    parser.add_argument("--bias_sigma", type=float, default=2.0, help="Gaussian width (higher = gentler)")
+    parser.add_argument("--bias_n_smooth", type=int, default=1, help="Smoothing neighbors")
+    parser.add_argument("--bias_tmin", type=float, default=0.0, help="Min noise level for bias")
 
     args = parser.parse_args()
 
-    # Build minimal configs for inference only
+    # Build configs for dataloader
     base_configs = {**configs_base, **{"data": data_configs}, **inference_configs}
     model_specifics = model_configs.get(args.model_name, {})
 
     def deep_update(d, u):
         for k, v in u.items():
-            if isinstance(v, Mapping) and k in d and isinstance(d[k], Mapping):
+            if isinstance(v, dict) and k in d and isinstance(d[k], dict):
                 deep_update(d[k], v)
             else:
                 d[k] = v
         return d
 
     deep_update(base_configs, model_specifics)
-
-    # Manually set required fields to avoid parse_configs validation
-    base_configs["checkpoint_path"] = args.checkpoint_path
     base_configs["input_json_path"] = args.input_json
-    base_configs["output_dir"] = args.output_dir
+    base_configs["model_name"] = args.model_name
 
-    # Create config object directly
-    class Config:
-        def __init__(self, d):
-            for k, v in d.items():
-                if isinstance(v, dict):
-                    setattr(self, k, Config(v))
-                else:
-                    setattr(self, k, v)
+    from protenix.config.config import parse_configs
+    configs = parse_configs(
+        configs=base_configs,
+        arg_str="",
+        fill_required_with_null=True,
+    )
 
-    configs = Config(base_configs)
-
-    logger.info(f"Using model: {args.model_name}")
-
-    # Load data
+    # Get dataloader
     logger.info(f"Loading data from {args.input_json}")
-    with open(args.input_json) as f:
-        json_data = json.load(f)
-
-    if not isinstance(json_data, list):
-        json_data = [json_data]
+    dataloader = get_inference_dataloader(configs=configs)
 
     # Initialize runner
-    runner = DiversitySamplingRunner(configs)
+    runner = DiversitySamplingRunner(args.checkpoint_path, args.model_name, args.device)
 
     # Run sampling
     runner.run_diversity_sampling(
-        dataloader=json_data,
+        dataloader=dataloader,
         num_rounds=args.rounds,
         samples_per_round=args.samples,
+        output_dir=args.output_dir,
+        bias_weight=args.bias_weight,
+        bias_sigma=args.bias_sigma,
+        bias_n_smooth=args.bias_n_smooth,
+        bias_tmin=args.bias_tmin,
     )
 
 
 if __name__ == "__main__":
     main()
-
-# example
-# python run_diversity_sampling.py --input_json examples/casp/input_json/8VVJ.json --checkpoint_path checkpoint/protenix_base_default_v1.0.0.pt --rounds 3 --samples 1 --output_dir examples/diversity
