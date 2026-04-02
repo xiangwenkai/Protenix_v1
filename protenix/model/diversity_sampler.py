@@ -1,28 +1,19 @@
-# Copyright 2024 ByteDance and/or its affiliates.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# diversity_sampler.py
+# AF3_ReD-style diversity bias (mask-free simplified version)
 
-from typing import Optional
-
+from typing import Optional, List
 import torch
-import torch.nn.functional as F
 
 
 class DiversitySampler:
     """
-    Injects repulsive bias during diffusion sampling to encourage diverse conformations.
+    AF3_ReD-style repulsive bias during diffusion sampling.
 
-    Based on AF3_ReD implementation with Kabsch alignment and noise-dependent weighting.
+    Differences from original:
+    - No CA mask
+    - No atom mask
+    - No chain mask
+    - Uses all atoms
     """
 
     def __init__(
@@ -32,193 +23,146 @@ class DiversitySampler:
         n_smooth: int = 1,
         bias_tmin: float = 0.0,
     ):
-        """
-        Args:
-            weight: Strength of biasing potential
-            sigma: Width of biasing Gaussian potential
-            n_smooth: Number of neighbors for residue-level smoothing
-            bias_tmin: Minimum noise level below which no bias is applied
-        """
         self.weight = weight
         self.sigma = sigma
         self.n_smooth = n_smooth
         self.bias_tmin = bias_tmin
-        self.structure_bank = []
+        self.structure_bank: List[torch.Tensor] = []
+
+    # ============================================================
+    # Public API
+    # ============================================================
 
     def add_structure(self, x: torch.Tensor) -> None:
-        """Add a structure to the bank for repulsion."""
         self.structure_bank.append(x.detach().clone())
 
     def clear_bank(self) -> None:
-        """Clear the structure bank."""
         self.structure_bank = []
 
-    def _compute_optimal_rotation(
-        self, x_centered: torch.Tensor, x_ref_centered: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Compute optimal rotation matrix via SVD (Kabsch algorithm).
+    # ============================================================
+    # Core math
+    # ============================================================
 
-        Args:
-            x_centered: Centered coordinates [..., N_atom, 3]
-            x_ref_centered: Centered reference [..., N_atom, 3]
+    def _kabsch_align(self, x, x_ref):
+        x_center = x.mean(dim=-2, keepdim=True)
+        x_ref_center = x_ref.mean(dim=-2, keepdim=True)
 
-        Returns:
-            Rotation matrix [..., 3, 3]
-        """
-        # Compute covariance matrix: H = x_ref^T @ x / N
-        H = torch.einsum("...ni,...nj->...ij", x_ref_centered, x_centered) / x_centered.shape[-2]
+        x_c = x - x_center
+        x_ref_c = x_ref - x_ref_center
 
-        # SVD decomposition
-        U, _, Vt = torch.linalg.svd(H)
+        # covariance: ref^T * x
+        H = torch.einsum("...ni,...nj->...ij", x_ref_c, x_c)
 
-        # Rotation: R = U @ V^T
-        R = torch.einsum("...ij,...kj->...ik", U, Vt)
+        U, _, Vt = torch.linalg.svd(H.detach(), full_matrices=False)
 
-        # Ensure proper rotation (det(R) = 1, not reflection)
-        det = torch.linalg.det(R)
-        correction = torch.where(det < 0, -1.0, 1.0)
-        Vt_corrected = Vt * correction[..., None, None]
-        R = torch.einsum("...ij,...jk->...ik", U, Vt_corrected)
+        R = U @ Vt
 
-        return R
+        # ---- reflection correction (batch-safe) ----
+        det = torch.linalg.det(R)              # shape [...]
+        neg_mask = det < 0                    # shape [...]
 
-    def _compute_rmsd_gradient(
-        self, x: torch.Tensor, x_ref: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Compute RMSD gradient between x and x_ref with optimal alignment.
+        if neg_mask.any():
+            Vt_corrected = Vt.clone()
+            Vt_corrected[neg_mask, -1, :] *= -1
+            R = U @ Vt_corrected
 
-        Args:
-            x: Current coordinates [..., N_atom, 3]
-            x_ref: Reference coordinates [..., N_atom, 3]
+        # align reference onto x
+        x_ref_aligned = torch.einsum(
+            "...ni,...ij->...nj",
+            x_ref_c,
+            R,
+        ) + x_center
 
-        Returns:
-            RMSD gradient [..., N_atom, 3]
-        """
-        # Center both structures
-        x_mean = x.mean(dim=-2, keepdim=True)
-        x_ref_mean = x_ref.mean(dim=-2, keepdim=True)
-        x_centered = x - x_mean
-        x_ref_centered = x_ref - x_ref_mean
-
-        # Compute optimal rotation
-        R = self._compute_optimal_rotation(x_centered, x_ref_centered)
-
-        # Align x to x_ref: x_aligned = x_centered @ R^T
-        x_aligned = torch.einsum("...ij,...jk->...ik", x_centered, R.transpose(-2, -1))
-
-        # Compute RMSD
-        diff = x_aligned - x_ref_centered
-        rmsd_sq = (diff**2).sum(dim=-1).mean(dim=-1, keepdim=True)
-        rmsd = torch.sqrt(rmsd_sq + 1e-8)
-
-        # Gradient of RMSD w.r.t. x (chain rule through rotation)
-        grad = torch.einsum("...ij,...jk->...ik", diff, R) / (rmsd[..., None] + 1e-8)
-        return grad
+        return x_ref_aligned
 
     def _smooth_diffs(
-        self, diffs: torch.Tensor, atom_to_token_idx: torch.Tensor
+        self,
+        diffs: torch.Tensor,  # [N_bias, ..., N_atom, 3]
+        atom_to_token_idx: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Smooth differences at token level using n_smooth neighbors.
-
-        Args:
-            diffs: Differences [..., N_atom, 3]
-            atom_to_token_idx: Mapping from atoms to tokens [N_atom]
-
-        Returns:
-            Smoothed differences [..., N_atom, 3]
+        Token-level smoothing (same spirit as AF3 smoothing).
         """
+
         if self.n_smooth == 0:
             return diffs
 
         N_token = atom_to_token_idx.max().item() + 1
+
         token_diffs = torch.zeros(
-            (*diffs.shape[:-2], N_token, 3), device=diffs.device, dtype=diffs.dtype
+            (*diffs.shape[:-2], N_token, 3),
+            device=diffs.device,
+            dtype=diffs.dtype,
         )
 
-        # Aggregate to token level
+        # aggregate to token level
         for t in range(N_token):
-            atom_mask = atom_to_token_idx == t
-            if atom_mask.any():
-                token_diffs[..., t, :] = diffs[..., atom_mask, :].mean(dim=-2)
+            mask = atom_to_token_idx == t
+            if mask.any():
+                token_diffs[..., t, :] = diffs[..., mask, :].mean(dim=-2)
 
-        # Smooth at token level
-        smoothed_token_diffs = torch.zeros_like(token_diffs)
+        # smooth neighbors
+        smoothed = torch.zeros_like(token_diffs)
         for t in range(N_token):
-            neighbors = torch.arange(
-                max(0, t - self.n_smooth),
-                min(N_token, t + self.n_smooth + 1),
-                device=diffs.device,
-            )
-            smoothed_token_diffs[..., t, :] = token_diffs[..., neighbors, :].mean(dim=-2)
+            start = max(0, t - self.n_smooth)
+            end = min(N_token, t + self.n_smooth + 1)
+            smoothed[..., t, :] = token_diffs[..., start:end, :].mean(dim=-2)
 
-        # Broadcast back to atom level
-        smoothed_diffs = smoothed_token_diffs[..., atom_to_token_idx, :]
-        return smoothed_diffs
+        # broadcast back
+        return smoothed[..., atom_to_token_idx, :]
+
+    # ============================================================
+    # Main bias computation
+    # ============================================================
 
     def compute_bias(
         self,
-        x: torch.Tensor,
+        x: torch.Tensor,              # [..., N_atom, 3]
         noise_level: float,
         atom_to_token_idx: torch.Tensor,
     ) -> Optional[torch.Tensor]:
-        """
-        Compute biasing gradient using Gaussian potential.
 
-        Args:
-            x: Current coordinates [..., N_atom, 3]
-            noise_level: Current noise level (time step)
-            atom_to_token_idx: Mapping from atoms to tokens [N_atom]
-
-        Returns:
-            Biasing gradient [..., N_atom, 3] or None
-        """
-        if len(self.structure_bank) == 0 or noise_level < self.bias_tmin:
+        if len(self.structure_bank) == 0:
             return None
 
-        # Center coordinates
-        x_mean = x.mean(dim=-2, keepdim=True)
-        x_centered = x - x_mean
+        if noise_level <= self.bias_tmin:
+            return None
 
-        # Compute MSD for all reference structures
-        msd_list = []
-        diffs_list = []
+        N_atom = x.shape[-2]
+        sigma_eff = self.sigma + noise_level
+
+        grads = []
 
         for x_ref in self.structure_bank:
+
             if x_ref.shape != x.shape:
                 x_ref = x_ref.expand_as(x)
 
-            x_ref_mean = x_ref.mean(dim=-2, keepdim=True)
-            x_ref_centered = x_ref - x_ref_mean
+            # Kabsch alignment
+            x_ref_aligned = self._kabsch_align(x, x_ref)
 
-            # Kabsch alignment (uses fit_mask if provided)
-            R = self._compute_optimal_rotation(x_centered, x_ref_centered)
-            x_aligned = torch.einsum(
-                "...ij,...jk->...ik", x_centered, R.transpose(-2, -1)
+            # squared differences
+            diffs = x - x_ref_aligned
+
+            # MSD (mean over atoms)
+            msd = (diffs**2).sum(dim=-1).mean(dim=-1)  # [...]
+
+            # Gaussian weight
+            weight_exp = torch.exp(-msd / (2.0 * sigma_eff**2))
+
+            # smoothing
+            diffs_smoothed = self._smooth_diffs(diffs.unsqueeze(0), atom_to_token_idx)[0]
+
+            # AF3-style gradient (NO RMSD derivative)
+            grad = (
+                -self.weight
+                * weight_exp[..., None, None]
+                * diffs_smoothed
+                / (N_atom * sigma_eff**2)
             )
 
-            # Compute MSD
-            diffs = x_aligned - x_ref_centered
-            msd = (diffs**2).sum(dim=-1).mean(dim=-1)
-            msd_list.append(msd)
-            diffs_list.append(diffs)
+            grads.append(grad)
 
-        msd = torch.stack(msd_list, dim=0)  # [N_bias, ...]
-        diffs = torch.stack(diffs_list, dim=0)  # [N_bias, ..., N_atom, 3]
+        total_grad = torch.stack(grads, dim=0).sum(dim=0)
 
-        # Gaussian potential weight
-        sigma_eff = self.sigma + noise_level
-        bias_exp = torch.exp(-msd / (2.0 * sigma_eff**2))  # [N_bias, ...]
-        bias_exp = bias_exp[..., None, None]  # [N_bias, ..., 1, 1]
-
-        # Smooth differences at token level
-        diffs_smoothed = self._smooth_diffs(diffs, atom_to_token_idx)
-
-        # Compute gradient
-        grad = -self.weight * (bias_exp * diffs_smoothed).sum(dim=0) / (
-            sigma_eff**2 + 1e-8
-        )
-
-        return grad
+        return total_grad
