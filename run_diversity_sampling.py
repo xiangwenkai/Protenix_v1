@@ -127,6 +127,7 @@ class DiversitySamplingRunner:
 
             # Cache batch for reuse across rounds
 
+            best_ranking_score = 0
             for round_idx in range(num_rounds):
                 logger.info(f"Round {round_idx + 1}/{num_rounds}")
                 batch = copy.deepcopy(batch_data[0][0])
@@ -136,35 +137,43 @@ class DiversitySamplingRunner:
 
                 # Extract samples
                 if prediction is not None:
-                    x_samples = prediction["coordinate"]
-                    for i in range(min(samples_per_round, x_samples.shape[0])):
-                        diversity_sampler.add_structure(x_samples[i])
-                        sample = x_samples[i].cpu()
-                        all_samples.append(sample)
+                    current_score = 0.8*prediction['summary_confidence'][0]['iptm'].item() + 0.2*prediction['summary_confidence'][0]['ptm'].item()
+                    print(f"current_score: {current_score}")
+                    if best_ranking_score == 0:
+                        best_ranking_score = current_score
+                    elif current_score > best_ranking_score:
+                        best_ranking_score = current_score
+                    nice_score = current_score > best_ranking_score * 0.95
+                    if nice_score:
+                        x_samples = prediction["coordinate"]
+                        for i in range(min(samples_per_round, x_samples.shape[0])):
+                            is_add = diversity_sampler.add_structure(x_samples[i])
+                            sample = x_samples[i].cpu()
+                            
+                            if is_add:
+                                all_samples.append(sample)
+                                sample_idx = len(all_samples) - 1
 
-                        sample_idx = len(all_samples) - 1
+                            # Save as CIF if atom_array available
+                            if atom_array is not None and is_add:
+                                cif_path = output_path / f"sample_{sample_idx:03d}.cif"
+                                try:
+                                    save_structure_cif(
+                                        atom_array=atom_array,
+                                        pred_coordinate=sample,
+                                        output_fpath=str(cif_path),
+                                        entity_poly_type=entity_poly_type,
+                                        pdb_id=pdb_id,
+                                    )
+                                    logger.info(f"  Sample {i + 1}: {sample.shape}")
+                                except Exception as e:
+                                    logger.warning(f"Failed to save CIF: {e}")
+                            else:
+                                logger.info(f"  Sample {i + 1}: {sample.shape}")
 
-                        # Save as CIF if atom_array available
-                        if atom_array is not None:
-                            cif_path = output_path / f"sample_{sample_idx:03d}.cif"
-                            try:
-                                save_structure_cif(
-                                    atom_array=atom_array,
-                                    pred_coordinate=sample,
-                                    output_fpath=str(cif_path),
-                                    entity_poly_type=entity_poly_type,
-                                    pdb_id=pdb_id,
-                                )
-                                logger.info(f"  Sample {i + 1}: {sample.shape} -> {cif_path}")
-                            except Exception as e:
-                                logger.warning(f"Failed to save CIF: {e}")
-                                logger.info(f"  Sample {i + 1}: {sample.shape} -> {pt_path}")
-                        else:
-                            logger.info(f"  Sample {i + 1}: {sample.shape} -> {pt_path}")
+                        logger.info(f"  Bank size: {len(diversity_sampler.structure_bank)}")
 
-                logger.info(f"  Bank size: {len(diversity_sampler.structure_bank)}")
-
-        logger.info(f"\nSaved {len(all_samples)} samples to {output_path}")
+            logger.info(f"\nSaved {len(all_samples)} samples to {output_path}")
 
 
 def main():

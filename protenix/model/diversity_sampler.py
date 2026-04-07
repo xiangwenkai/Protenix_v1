@@ -20,7 +20,7 @@ class DiversitySampler:
         self,
         weight: float = 1.0,
         sigma: float = 2.0,
-        n_smooth: int = 1,
+        n_smooth: int = 10,
         bias_tmin: float = 0.0,
     ):
         self.weight = weight
@@ -33,8 +33,19 @@ class DiversitySampler:
     # Public API
     # ============================================================
 
-    def add_structure(self, x: torch.Tensor) -> None:
+    def add_structure(self, x: torch.Tensor) -> bool:
+        for x_ref in self.structure_bank:
+            if x_ref.shape != x.shape:
+                x_ref = x_ref.expand_as(x)
+            x_ref_aligned = self._kabsch_align(x, x_ref)
+            diffs = x - x_ref_aligned
+            msd = (diffs**2).sum(dim=-1).mean(dim=-1)
+            rmsd = torch.sqrt(msd).min().item()
+            if rmsd < 2.0:
+                return False
         self.structure_bank.append(x.detach().clone())
+        return True
+
 
     def clear_bank(self) -> None:
         self.structure_bank = []
