@@ -165,7 +165,7 @@ class DiversitySamplingRunner:
                                         entity_poly_type=entity_poly_type,
                                         pdb_id=pdb_id,
                                     )
-                                    logger.info(f"  Sample {i + 1}: {sample.shape}")
+                                    logger.info(f"  Sample {i + 1}: {sample.shape} -> {cif_path}")
                                 except Exception as e:
                                     logger.warning(f"Failed to save CIF: {e}")
                             else:

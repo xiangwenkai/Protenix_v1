@@ -20,7 +20,7 @@ class DiversitySampler:
         self,
         weight: float = 1.0,
         sigma: float = 2.0,
-        n_smooth: int = 10,
+        n_smooth: int = 1,
         bias_tmin: float = 0.0,
     ):
         self.weight = weight
@@ -45,7 +45,6 @@ class DiversitySampler:
                 return False
         self.structure_bank.append(x.detach().clone())
         return True
-
 
     def clear_bank(self) -> None:
         self.structure_bank = []
