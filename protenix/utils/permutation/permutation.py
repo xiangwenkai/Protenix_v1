@@ -398,7 +398,7 @@ class SymmetricPermutation(object):
         Returns:
             dict: The updated `pred_dict`
         """
-
+        per_sample_contact_probs = []
         for i, perm_indices in enumerate(permute_pred_indices):
             # permute atoms at dim=-2
             for key in ["plddt", "resolved"]:
@@ -439,13 +439,11 @@ class SymmetricPermutation(object):
                 contact_probs_i = contact_probs_i[..., perm_token_indices, :][
                     ..., perm_token_indices
                 ]  # [N_token, N_token]
-                pred_dict.setdefault("per_sample_contact_probs", []).append(
-                    contact_probs_i
-                )
+                per_sample_contact_probs.append(contact_probs_i)
 
-        if "per_sample_contact_probs" in pred_dict:
+        if per_sample_contact_probs:
             pred_dict["per_sample_contact_probs"] = torch.stack(
-                pred_dict["per_sample_contact_probs"], dim=0
+                per_sample_contact_probs, dim=0
             )  # [N_sample, N_token, N_token]
 
         return pred_dict

@@ -464,6 +464,93 @@ class Protenix(nn.Module):
         selected_idx = int(per_head_loss.argmin().item())
         return selected_idx, target_dict
 
+    def _run_training_diffusion_branch(
+        self,
+        input_feature_dict: dict[str, Any],
+        label_dict: dict[str, Any],
+        s_inputs: torch.Tensor,
+        s: torch.Tensor,
+        z_branch: torch.Tensor,
+        use_conditioning: bool,
+        inplace_safe: bool,
+        compute_confidence: bool = False,
+    ) -> dict[str, Any]:
+        branch_pred = {}
+        cache = self._prepare_diffusion_cache(input_feature_dict, z_branch)
+        _, x_denoised, x_noise_level = autocasting_disable_decorator(
+            self.configs.skip_amp.sample_diffusion_training
+        )(sample_diffusion_training)(
+            noise_sampler=self.train_noise_sampler,
+            denoise_net=self.diffusion_module,
+            label_dict=label_dict,
+            input_feature_dict=input_feature_dict,
+            s_inputs=s_inputs,
+            s_trunk=s,
+            z_trunk=None if cache["pair_z"] is not None else z_branch,
+            pair_z=cache["pair_z"],
+            p_lm=cache["p_lm/c_l"][0],
+            c_l=cache["p_lm/c_l"][1],
+            N_sample=self.diffusion_batch_size,
+            diffusion_chunk_size=self.configs.diffusion_chunk_size,
+            use_conditioning=use_conditioning,
+            enable_efficient_fusion=self.enable_efficient_fusion,
+        )
+        branch_pred["coordinate"] = x_denoised
+        branch_pred["noise_level"] = x_noise_level
+        branch_pred["distogram"] = autocasting_disable_decorator(True)(
+            self.distogram_head
+        )(z_branch)
+
+        if compute_confidence:
+            contact_probs = autocasting_disable_decorator(True)(
+                sample_confidence.compute_contact_prob
+            )(
+                distogram_logits=branch_pred["distogram"],
+                **sample_confidence.get_bin_params(self.configs.loss.distogram),
+            )
+            (
+                branch_pred["plddt"],
+                branch_pred["pae"],
+                branch_pred["pde"],
+                branch_pred["resolved"],
+            ) = self.run_confidence_head(
+                input_feature_dict=input_feature_dict,
+                s_inputs=s_inputs,
+                s_trunk=s,
+                z_trunk=z_branch,
+                pair_mask=None,
+                x_pred_coords=branch_pred["coordinate"],
+                triangle_multiplicative=self.configs.triangle_multiplicative,
+                triangle_attention=self.configs.triangle_attention,
+                inplace_safe=inplace_safe,
+                chunk_size=None,
+            )
+            summary_confidence, _ = autocasting_disable_decorator(True)(
+                sample_confidence.compute_full_data_and_summary
+            )(
+                configs=self.configs,
+                pae_logits=branch_pred["pae"],
+                plddt_logits=branch_pred["plddt"],
+                pde_logits=branch_pred["pde"],
+                contact_probs=contact_probs.unsqueeze(0).expand(
+                    branch_pred["coordinate"].shape[0], -1, -1
+                ),
+                token_asym_id=input_feature_dict["asym_id"],
+                token_has_frame=input_feature_dict["has_frame"],
+                atom_coordinate=branch_pred["coordinate"],
+                atom_to_token_idx=input_feature_dict["atom_to_token_idx"],
+                atom_is_polymer=1 - input_feature_dict["is_ligand"],
+                N_recycle=self.N_cycle,
+                interested_atom_mask=None,
+                return_full_data=False,
+                mol_id=input_feature_dict["mol_id"],
+                elements_one_hot=input_feature_dict["ref_element"],
+            )
+            branch_pred["summary_confidence_scores"] = (
+                sample_confidence.merge_per_sample_confidence_scores(summary_confidence)
+            )
+        return branch_pred
+
     def _run_inference_for_z(
         self,
         input_feature_dict: dict[str, Any],
@@ -920,7 +1007,7 @@ class Protenix(nn.Module):
             tuple[dict[str, torch.Tensor], dict[str, Any], dict[str, Any]]:
                 Prediction, updated label, and log dictionaries.
         """
-
+        z_base = None
         s_inputs, s, z = self.get_pairformer_output(
             input_feature_dict=input_feature_dict,
             N_cycle=N_cycle,
@@ -941,6 +1028,7 @@ class Protenix(nn.Module):
             label_dict=label_dict,
         )
         if selected_head_idx is not None:
+            z_base = z
             z = self._inject_cross_pair_delta(
                 z=z,
                 prot_idx=proposal_data["prot_idx"],
@@ -1069,6 +1157,56 @@ class Protenix(nn.Module):
                 "noise_level": x_noise_level,
             }
         )
+
+        if (
+            proposal_data is not None
+            and z_base is not None
+            and proposal_data["logits"].shape[0] > 1
+            and (
+                self.configs.loss.weight.alpha_cross_pair_quality > 0.0
+                or self.configs.loss.weight.alpha_random_head_struct > 0.0
+            )
+        ):
+            candidate_heads = [
+                idx
+                for idx in range(proposal_data["logits"].shape[0])
+                if idx != selected_head_idx
+            ]
+            random_head_idx = random.choice(candidate_heads)
+            z_random = self._inject_cross_pair_delta(
+                z=z_base,
+                prot_idx=proposal_data["prot_idx"],
+                rna_idx=proposal_data["rna_idx"],
+                delta_pr=proposal_data["delta_pr"][random_head_idx],
+                delta_rp=proposal_data["delta_rp"][random_head_idx],
+            )
+            random_branch_pred = self._run_training_diffusion_branch(
+                input_feature_dict=input_feature_dict,
+                label_dict=label_dict,
+                s_inputs=s_inputs,
+                s=s,
+                z_branch=z_random,
+                use_conditioning=not drop_conditioning,
+                inplace_safe=inplace_safe,
+                compute_confidence=True,
+            )
+            pred_dict.update(
+                {
+                    "coordinate_random_head": random_branch_pred["coordinate"],
+                    "noise_level_random_head": random_branch_pred["noise_level"],
+                    "distogram_random_head": random_branch_pred["distogram"],
+                    "plddt_random_head": random_branch_pred["plddt"],
+                    "pae_random_head": random_branch_pred["pae"],
+                    "pde_random_head": random_branch_pred["pde"],
+                    "resolved_random_head": random_branch_pred["resolved"],
+                    "summary_confidence_scores_random_head": random_branch_pred[
+                        "summary_confidence_scores"
+                    ],
+                    "cross_pair_random_head_idx": torch.tensor(
+                        random_head_idx, device=z.device, dtype=torch.long
+                    ),
+                }
+            )
 
         # Permute symmetric atom/chain in each sample to match true structure
         # Note: currently chains cannot be permuted since label is cropped

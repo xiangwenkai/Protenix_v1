@@ -180,7 +180,15 @@ class KWayCrossPairProposal(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
         )
-        self.head_embed = nn.Parameter(torch.randn(num_heads, hidden_dim))
+        # Base head slots provide stable specialization, while the query MLP
+        # makes each head input-conditioned for the current cross-pair pattern.
+        self.head_slots = nn.Parameter(torch.randn(num_heads, hidden_dim))
+        self.query_ln = nn.LayerNorm(hidden_dim)
+        self.query_mlp = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, num_heads * hidden_dim),
+        )
         self.contact_head = nn.Linear(hidden_dim, 1)
         self.delta_head_pr = nn.Linear(hidden_dim, c_z)
         self.delta_head_rp = nn.Linear(hidden_dim, c_z)
@@ -198,9 +206,14 @@ class KWayCrossPairProposal(nn.Module):
             delta_rp: [K, N_protein_token, N_rna_token, c_z]
         """
         h = self.shared(self.input_ln(z_pr))
+        pooled = h.mean(dim=(0, 1))
+        dynamic_queries = self.query_mlp(self.query_ln(pooled)).view(
+            self.num_heads, self.hidden_dim
+        )
+        head_queries = self.head_slots + dynamic_queries
         logits, deltas_pr, deltas_rp = [], [], []
         for head_idx in range(self.num_heads):
-            h_k = h + self.head_embed[head_idx].view(1, 1, -1)
+            h_k = h + head_queries[head_idx].view(1, 1, -1)
             contact_logits = self.contact_head(h_k).squeeze(-1)
             contact_probs = torch.sigmoid(contact_logits)
             delta_gate = contact_probs.unsqueeze(-1) * self.delta_scale

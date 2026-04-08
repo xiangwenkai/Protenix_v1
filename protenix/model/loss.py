@@ -1516,6 +1516,118 @@ class CrossPairProposalLoss(nn.Module):
         return total_loss, metrics
 
 
+class CrossPairBalanceLoss(nn.Module):
+    """Encourage soft head assignments to remain reasonably balanced."""
+
+    def __init__(
+        self,
+        contact_threshold: float = 8.0,
+        dice_weight: float = 1.0,
+        softmax_temperature: float = 0.1,
+        eps: float = 1e-6,
+    ) -> None:
+        super(CrossPairBalanceLoss, self).__init__()
+        self.contact_threshold = contact_threshold
+        self.dice_weight = dice_weight
+        self.softmax_temperature = softmax_temperature
+        self.eps = eps
+
+    def forward(
+        self,
+        feat_dict: dict[str, Any],
+        pred_dict: dict[str, torch.Tensor],
+        label_dict: dict[str, Any],
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        logits = pred_dict.get("cross_pair_logits")
+        if logits is None:
+            zero = label_dict["coordinate"].new_zeros(())
+            return zero, {"imbalance": zero.detach()}
+
+        target_dict = build_cross_pair_target_contact_map(
+            feat_dict=feat_dict,
+            label_dict=label_dict,
+            contact_threshold=self.contact_threshold,
+        )
+        if target_dict is None:
+            zero = logits.new_zeros(())
+            return zero, {"imbalance": zero.detach()}
+
+        per_head = compute_per_head_contact_losses(
+            logits=logits,
+            target=target_dict["target"],
+            pair_valid_mask=target_dict["pair_valid_mask"],
+            dice_weight=self.dice_weight,
+            eps=self.eps,
+        )
+        assignment = torch.softmax(-per_head / self.softmax_temperature, dim=0)
+        uniform = torch.full_like(assignment, 1.0 / assignment.numel())
+        loss = torch.mean((assignment - uniform) ** 2)
+        return loss, {
+            "imbalance": loss.detach(),
+            "assign_max": assignment.max().detach(),
+            "assign_min": assignment.min().detach(),
+        }
+
+
+class CrossPairQualityThresholdLoss(nn.Module):
+    """Keep non-oracle sampled heads above confidence thresholds without forcing exact fit."""
+
+    def __init__(
+        self,
+        plddt_min: float = 70.0,
+        ptm_min: float = 0.4,
+        iptm_min: float = 0.4,
+        ranking_score_min: float = 0.2,
+    ) -> None:
+        super(CrossPairQualityThresholdLoss, self).__init__()
+        self.plddt_min = plddt_min
+        self.ptm_min = ptm_min
+        self.iptm_min = iptm_min
+        self.ranking_score_min = ranking_score_min
+
+    def forward(
+        self,
+        pred_dict: dict[str, torch.Tensor],
+        label_dict: dict[str, Any],
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        scores = pred_dict.get("summary_confidence_scores_random_head")
+        if scores is None:
+            zero = label_dict["coordinate"].new_zeros(())
+            return zero, {
+                "plddt_gate": zero.detach(),
+                "ptm_gate": zero.detach(),
+                "iptm_gate": zero.detach(),
+                "ranking_gate": zero.detach(),
+            }
+
+        def _best_score(key: str) -> torch.Tensor:
+            val = scores[key]
+            if val.dim() == 0:
+                return val
+            return val.max()
+
+        plddt_gate = torch.relu(
+            scores["plddt"].new_tensor(self.plddt_min) - _best_score("plddt")
+        )
+        ptm_gate = torch.relu(
+            scores["ptm"].new_tensor(self.ptm_min) - _best_score("ptm")
+        )
+        iptm_gate = torch.relu(
+            scores["iptm"].new_tensor(self.iptm_min) - _best_score("iptm")
+        )
+        ranking_gate = torch.relu(
+            scores["ranking_score"].new_tensor(self.ranking_score_min)
+            - _best_score("ranking_score")
+        )
+        total = plddt_gate + ptm_gate + iptm_gate + ranking_gate
+        return total, {
+            "plddt_gate": plddt_gate.detach(),
+            "ptm_gate": ptm_gate.detach(),
+            "iptm_gate": iptm_gate.detach(),
+            "ranking_gate": ranking_gate.detach(),
+        }
+
+
 class ProtenixLoss(nn.Module):
     """Aggregation of the various losses"""
 
@@ -1531,6 +1643,9 @@ class ProtenixLoss(nn.Module):
         self.alpha_bond = self.configs.loss.weight.alpha_bond
         self.weight_smooth_lddt = self.configs.loss.weight.smooth_lddt
         self.alpha_cross_pair = self.configs.loss.weight.alpha_cross_pair
+        self.alpha_cross_pair_balance = self.configs.loss.weight.alpha_cross_pair_balance
+        self.alpha_cross_pair_quality = self.configs.loss.weight.alpha_cross_pair_quality
+        self.alpha_random_head_struct = self.configs.loss.weight.alpha_random_head_struct
 
         self.lddt_radius = {
             "is_nucleotide_threshold": 30.0,
@@ -1552,6 +1667,11 @@ class ProtenixLoss(nn.Module):
             "distogram_loss": self.alpha_distogram,
             # proposal
             "cross_pair_loss": self.alpha_cross_pair,
+            "cross_pair_balance_loss": self.alpha_cross_pair_balance,
+            "cross_pair_quality_loss": self.alpha_cross_pair_quality,
+            "random_head_smooth_lddt_loss": self.alpha_random_head_struct,
+            "random_head_bond_loss": self.alpha_random_head_struct
+            * self.alpha_bond,
         }
 
         # Loss
@@ -1565,6 +1685,15 @@ class ProtenixLoss(nn.Module):
         self.distogram_loss = DistogramLoss(**configs.loss.distogram)
         self.cross_pair_proposal_loss = CrossPairProposalLoss(
             **configs.loss.cross_pair_proposal
+        )
+        self.cross_pair_balance_loss = CrossPairBalanceLoss(
+            contact_threshold=configs.loss.cross_pair_proposal.contact_threshold,
+            dice_weight=configs.loss.cross_pair_proposal.dice_weight,
+            softmax_temperature=configs.loss.cross_pair_balance.softmax_temperature,
+            eps=configs.loss.cross_pair_balance.eps,
+        )
+        self.cross_pair_quality_loss = CrossPairQualityThresholdLoss(
+            **configs.loss.cross_pair_quality
         )
 
     def calculate_label(
@@ -1819,6 +1948,95 @@ class ProtenixLoss(nn.Module):
                             feat_dict=feat_dict,
                             pred_dict=pred_dict,
                             label_dict=label_dict,
+                        )
+                    }
+                )
+                loss_fns.update(
+                    {
+                        "cross_pair_balance_loss": lambda: self.cross_pair_balance_loss(
+                            feat_dict=feat_dict,
+                            pred_dict=pred_dict,
+                            label_dict=label_dict,
+                        )
+                    }
+                )
+            if pred_dict.get("summary_confidence_scores_random_head") is not None:
+                loss_fns.update(
+                    {
+                        "cross_pair_quality_loss": lambda: self.cross_pair_quality_loss(
+                            pred_dict=pred_dict,
+                            label_dict=label_dict,
+                        )
+                    }
+                )
+            if pred_dict.get("coordinate_random_head") is not None:
+                random_per_sample_scale = (
+                    pred_dict["noise_level_random_head"] ** 2
+                    + self.configs.sigma_data**2
+                ) / (
+                    self.configs.sigma_data * pred_dict["noise_level_random_head"]
+                ) ** 2
+                if self.configs.loss.diffusion_lddt_loss_dense:
+                    loss_fns.update(
+                        {
+                            "random_head_smooth_lddt_loss": lambda: self.smooth_lddt_loss.dense_forward(
+                                pred_coordinate=pred_dict["coordinate_random_head"],
+                                true_coordinate=label_dict["coordinate"],
+                                lddt_mask=label_dict["lddt_mask"],
+                                diffusion_chunk_size=self.configs.loss.diffusion_lddt_chunk_size,
+                                true_distance=label_dict.get("distance"),
+                            )
+                        }
+                    )
+                elif self.configs.loss.diffusion_sparse_loss_enable:
+                    loss_fns.update(
+                        {
+                            "random_head_smooth_lddt_loss": lambda: self.smooth_lddt_loss.sparse_forward(
+                                pred_coordinate=pred_dict["coordinate_random_head"],
+                                true_coordinate=label_dict["coordinate"],
+                                lddt_mask=label_dict["lddt_mask"],
+                                diffusion_chunk_size=self.configs.loss.diffusion_lddt_chunk_size,
+                            )
+                        }
+                    )
+                else:
+                    random_distance = torch.cdist(
+                        pred_dict["coordinate_random_head"].float(),
+                        pred_dict["coordinate_random_head"].float(),
+                    ).to(pred_dict["coordinate_random_head"].dtype)
+                    loss_fns.update(
+                        {
+                            "random_head_smooth_lddt_loss": lambda random_distance=random_distance: self.smooth_lddt_loss(
+                                pred_distance=random_distance,
+                                true_distance=label_dict["distance"],
+                                distance_mask=label_dict["distance_mask"],
+                                lddt_mask=label_dict["lddt_mask"],
+                                diffusion_chunk_size=self.configs.loss.diffusion_lddt_chunk_size,
+                            )
+                        }
+                    )
+                loss_fns.update(
+                    {
+                        "random_head_bond_loss": lambda: (
+                            self.bond_loss.sparse_forward(
+                                pred_coordinate=pred_dict["coordinate_random_head"],
+                                true_coordinate=label_dict["coordinate"],
+                                distance_mask=label_dict["distance_mask"],
+                                bond_mask=feat_dict["bond_mask"],
+                                per_sample_scale=random_per_sample_scale,
+                            )
+                            if self.configs.loss.diffusion_sparse_loss_enable
+                            else self.bond_loss(
+                                pred_distance=torch.cdist(
+                                    pred_dict["coordinate_random_head"].float(),
+                                    pred_dict["coordinate_random_head"].float(),
+                                ).to(pred_dict["coordinate_random_head"].dtype),
+                                true_distance=label_dict["distance"],
+                                distance_mask=label_dict["distance_mask"],
+                                bond_mask=feat_dict["bond_mask"],
+                                per_sample_scale=random_per_sample_scale,
+                                diffusion_chunk_size=self.configs.loss.diffusion_bond_chunk_size,
+                            )
                         )
                     }
                 )

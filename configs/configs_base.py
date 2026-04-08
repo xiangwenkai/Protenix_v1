@@ -351,6 +351,9 @@ loss_configs = {
             "alpha_diffusion": 4.0,
             "alpha_distogram": 3e-2,
             "alpha_cross_pair": 0.0,
+            "alpha_cross_pair_balance": 0.0,
+            "alpha_cross_pair_quality": 0.0,
+            "alpha_random_head_struct": 0.0,
             "alpha_bond": 0.0,  # or 1 in finetuning stages
             "smooth_lddt": 1.0,  # or 0 in finetuning stages
         },
@@ -404,6 +407,16 @@ loss_configs = {
             "diversity_weight": 0.2,
             "softmin_temperature": 0.1,
             "eps": 1e-6,
+        },
+        "cross_pair_balance": {
+            "softmax_temperature": 0.1,
+            "eps": 1e-6,
+        },
+        "cross_pair_quality": {
+            "plddt_min": 70.0,
+            "ptm_min": 0.4,
+            "iptm_min": 0.4,
+            "ranking_score_min": 0.2,
         },
     },
     "metrics": {
