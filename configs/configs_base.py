@@ -295,6 +295,14 @@ model_configs = {
             "c_z": GlobalConfigValue("c_z"),
             "no_bins": GlobalConfigValue("no_bins"),
         },
+        "cross_pair_proposal": {
+            "enable": False,
+            "c_z": GlobalConfigValue("c_z"),
+            "hidden_dim": GlobalConfigValue("c_z"),
+            "num_heads": 5,
+            "delta_scale": 1.0,
+            "contact_threshold": 8.0,
+        },
     },
 }
 perm_configs = {
@@ -342,6 +350,7 @@ loss_configs = {
             "alpha_except_pae": 1.0,
             "alpha_diffusion": 4.0,
             "alpha_distogram": 3e-2,
+            "alpha_cross_pair": 0.0,
             "alpha_bond": 0.0,  # or 1 in finetuning stages
             "smooth_lddt": 1.0,  # or 0 in finetuning stages
         },
@@ -386,6 +395,14 @@ loss_configs = {
             "min_bin": 2.3125,
             "max_bin": 21.6875,
             "no_bins": 64,
+            "eps": 1e-6,
+        },
+        "cross_pair_proposal": {
+            "contact_threshold": 8.0,
+            "dice_weight": 1.0,
+            "diversity_margin": 0.5,
+            "diversity_weight": 0.2,
+            "softmin_temperature": 0.1,
             "eps": 1e-6,
         },
     },

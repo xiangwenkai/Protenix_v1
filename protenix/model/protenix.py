@@ -30,6 +30,12 @@ from protenix.model.generator import (
     TrainingNoiseSampler,
 )
 from protenix.model.modules.confidence import ConfidenceHead
+from protenix.model.modules.cross_pair_proposal import (
+    atom_mask_to_token_mask,
+    build_cross_pair_target_contact_map,
+    compute_per_head_contact_losses,
+    KWayCrossPairProposal,
+)
 from protenix.model.modules.diffusion import DiffusionModule
 from protenix.model.modules.embedders import (
     ConstraintEmbedder,
@@ -136,6 +142,12 @@ class Protenix(nn.Module):
         self.diffusion_module = DiffusionModule(**configs.model.diffusion_module)
         self.distogram_head = DistogramHead(**configs.model.distogram_head)
         self.confidence_head = ConfidenceHead(**configs.model.confidence_head)
+        self.cross_pair_proposal_enabled = configs.model.cross_pair_proposal.enable
+        self.cross_pair_proposal = (
+            KWayCrossPairProposal(**configs.model.cross_pair_proposal)
+            if self.cross_pair_proposal_enabled
+            else None
+        )
 
         self.c_s, self.c_z, self.c_s_inputs = (
             configs.c_s,
@@ -346,6 +358,214 @@ class Protenix(nn.Module):
             self.confidence_head
         )(*args, **kwargs)
 
+    def _prepare_diffusion_cache(
+        self,
+        input_feature_dict: dict[str, Any],
+        z: torch.Tensor,
+    ) -> dict[str, Any]:
+        cache = dict()
+        if self.enable_diffusion_shared_vars_cache:
+            cache["pair_z"] = autocasting_disable_decorator(
+                self.configs.skip_amp.sample_diffusion
+            )(self.diffusion_module.diffusion_conditioning.prepare_cache)(
+                input_feature_dict["relp"], z, False
+            )
+            cache["p_lm/c_l"] = autocasting_disable_decorator(
+                self.configs.skip_amp.sample_diffusion
+            )(self.diffusion_module.atom_attention_encoder.prepare_cache)(
+                ref_pos=input_feature_dict["ref_pos"],
+                ref_charge=input_feature_dict["ref_charge"],
+                ref_mask=input_feature_dict["ref_mask"],
+                ref_element=input_feature_dict["ref_element"],
+                ref_atom_name_chars=input_feature_dict["ref_atom_name_chars"],
+                atom_to_token_idx=input_feature_dict["atom_to_token_idx"],
+                d_lm=input_feature_dict["d_lm"],
+                v_lm=input_feature_dict["v_lm"],
+                pad_info=input_feature_dict["pad_info"],
+                r_l=True,
+                z=cache["pair_z"],
+                inplace_safe=False,
+            )
+        else:
+            cache["pair_z"] = None
+            cache["p_lm/c_l"] = [None, None]
+        return cache
+
+    def _inject_cross_pair_delta(
+        self,
+        z: torch.Tensor,
+        prot_idx: torch.Tensor,
+        rna_idx: torch.Tensor,
+        delta_pr: torch.Tensor,
+        delta_rp: torch.Tensor,
+    ) -> torch.Tensor:
+        z_mod = z.clone()
+        z_mod[prot_idx[:, None], rna_idx[None, :], :] = (
+            z_mod[prot_idx[:, None], rna_idx[None, :], :] + delta_pr
+        )
+        z_mod[rna_idx[:, None], prot_idx[None, :], :] = (
+            z_mod[rna_idx[:, None], prot_idx[None, :], :] + delta_rp.transpose(0, 1)
+        )
+        return z_mod
+
+    def _get_cross_pair_proposal_data(
+        self,
+        z: torch.Tensor,
+        input_feature_dict: dict[str, Any],
+    ) -> Optional[dict[str, torch.Tensor]]:
+        if (not self.cross_pair_proposal_enabled) or (self.cross_pair_proposal is None):
+            return None
+        atom_to_token_idx = input_feature_dict["atom_to_token_idx"].long()
+        n_token = int(input_feature_dict["token_index"].shape[-1])
+        prot_token_mask = atom_mask_to_token_mask(
+            input_feature_dict["is_protein"].bool(), atom_to_token_idx, n_token
+        )
+        rna_token_mask = atom_mask_to_token_mask(
+            input_feature_dict["is_rna"].bool(), atom_to_token_idx, n_token
+        )
+        prot_idx = torch.nonzero(prot_token_mask, as_tuple=False).squeeze(-1)
+        rna_idx = torch.nonzero(rna_token_mask, as_tuple=False).squeeze(-1)
+        if prot_idx.numel() == 0 or rna_idx.numel() == 0:
+            return None
+        z_pr = z[prot_idx[:, None], rna_idx[None, :], :]
+        logits, delta_pr, delta_rp = self.cross_pair_proposal(z_pr)
+        probs = torch.sigmoid(logits)
+        return {
+            "logits": logits,
+            "probs": probs,
+            "delta_pr": delta_pr,
+            "delta_rp": delta_rp,
+            "prot_idx": prot_idx,
+            "rna_idx": rna_idx,
+        }
+
+    def _select_training_cross_pair_head(
+        self,
+        proposal_data: Optional[dict[str, torch.Tensor]],
+        feat_dict: dict[str, Any],
+        label_dict: dict[str, Any],
+    ) -> tuple[Optional[int], Optional[dict[str, torch.Tensor]]]:
+        if proposal_data is None:
+            return None, None
+        target_dict = build_cross_pair_target_contact_map(
+            feat_dict=feat_dict,
+            label_dict=label_dict,
+            contact_threshold=self.configs.loss.cross_pair_proposal.contact_threshold,
+        )
+        if target_dict is None:
+            return None, None
+        per_head_loss = compute_per_head_contact_losses(
+            logits=proposal_data["logits"],
+            target=target_dict["target"],
+            pair_valid_mask=target_dict["pair_valid_mask"],
+            dice_weight=self.configs.loss.cross_pair_proposal.dice_weight,
+            eps=self.configs.loss.cross_pair_proposal.eps,
+        )
+        selected_idx = int(per_head_loss.argmin().item())
+        return selected_idx, target_dict
+
+    def _run_inference_for_z(
+        self,
+        input_feature_dict: dict[str, Any],
+        s_inputs: torch.Tensor,
+        s: torch.Tensor,
+        z: torch.Tensor,
+        N_cycle: int,
+        mode: str,
+        n_sample: int,
+        step_st: float,
+        step_trunk: float,
+        inplace_safe: bool,
+        chunk_size: Optional[int],
+        diversity_sampler: Any,
+    ) -> tuple[dict[str, Any], dict[str, float]]:
+        pred_dict = {}
+        time_tracker = {}
+        noise_schedule = self.inference_noise_scheduler(
+            N_step=self.configs.sample_diffusion["N_step"],
+            device=s_inputs.device,
+            dtype=s_inputs.dtype,
+        )
+        cache = self._prepare_diffusion_cache(input_feature_dict, z)
+        pred_dict["coordinate"] = self.sample_diffusion(
+            denoise_net=self.diffusion_module,
+            input_feature_dict=input_feature_dict,
+            s_inputs=s_inputs,
+            s_trunk=s,
+            z_trunk=None if cache["pair_z"] is not None else z,
+            pair_z=cache["pair_z"],
+            p_lm=cache["p_lm/c_l"][0],
+            c_l=cache["p_lm/c_l"][1],
+            N_sample=n_sample,
+            noise_schedule=noise_schedule,
+            inplace_safe=inplace_safe,
+            enable_efficient_fusion=self.enable_efficient_fusion,
+            diversity_sampler=diversity_sampler,
+        )
+        step_diffusion = time.time()
+        time_tracker.update({"diffusion": step_diffusion - step_trunk})
+        contact_probs = autocasting_disable_decorator(True)(
+            sample_confidence.compute_contact_prob
+        )(
+            distogram_logits=self.distogram_head(z),
+            **sample_confidence.get_bin_params(self.configs.loss.distogram),
+        )
+        pred_dict["contact_probs"] = contact_probs
+        pred_dict["per_sample_contact_probs"] = contact_probs.unsqueeze(0).expand(
+            n_sample, -1, -1
+        )
+        (
+            pred_dict["plddt"],
+            pred_dict["pae"],
+            pred_dict["pde"],
+            pred_dict["resolved"],
+        ) = self.run_confidence_head(
+            input_feature_dict=input_feature_dict,
+            s_inputs=s_inputs,
+            s_trunk=s,
+            z_trunk=z,
+            pair_mask=None,
+            x_pred_coords=pred_dict["coordinate"],
+            triangle_multiplicative=self.configs.triangle_multiplicative,
+            triangle_attention=self.configs.triangle_attention,
+            inplace_safe=inplace_safe,
+            chunk_size=chunk_size,
+        )
+        step_confidence = time.time()
+        time_tracker.update({"confidence": step_confidence - step_diffusion})
+        time_tracker.update({"model_forward": time.time() - step_st})
+        if mode == "inference":
+            interested_atom_mask = None
+            mol_id = None
+            elements_one_hot = None
+        else:
+            interested_atom_mask = None
+            mol_id = input_feature_dict["mol_id"]
+            elements_one_hot = input_feature_dict["ref_element"]
+        (
+            pred_dict["summary_confidence"],
+            pred_dict["full_data"],
+        ) = autocasting_disable_decorator(True)(
+            sample_confidence.compute_full_data_and_summary
+        )(
+            configs=self.configs,
+            pae_logits=pred_dict["pae"],
+            plddt_logits=pred_dict["plddt"],
+            pde_logits=pred_dict["pde"],
+            contact_probs=pred_dict["per_sample_contact_probs"],
+            token_asym_id=input_feature_dict["asym_id"],
+            token_has_frame=input_feature_dict["has_frame"],
+            atom_coordinate=pred_dict["coordinate"],
+            atom_to_token_idx=input_feature_dict["atom_to_token_idx"],
+            atom_is_polymer=1 - input_feature_dict["is_ligand"],
+            N_recycle=N_cycle,
+            interested_atom_mask=interested_atom_mask,
+            return_full_data=True,
+            mol_id=mol_id,
+            elements_one_hot=elements_one_hot,
+        )
+        return pred_dict, time_tracker
+
     def main_inference_loop(
         self,
         input_feature_dict: dict[str, Any],
@@ -521,89 +741,144 @@ class Protenix(nn.Module):
             del input_feature_dict[key]
         step_trunk = time.time()
         time_tracker.update({"pairformer": step_trunk - step_st})
-        # Sample diffusion
-        # [..., N_sample, N_atom, 3]
         N_sample = self.configs.sample_diffusion["N_sample"]
-        N_step = self.configs.sample_diffusion["N_step"]
-
-        noise_schedule = self.inference_noise_scheduler(
-            N_step=N_step, device=s_inputs.device, dtype=s_inputs.dtype
-        )
-        cache = dict()
-        if self.enable_diffusion_shared_vars_cache:
-            # line 1-5 of algorithm 21 calculate z in diffusion conditioning
-            cache["pair_z"] = autocasting_disable_decorator(
-                self.configs.skip_amp.sample_diffusion
-            )(self.diffusion_module.diffusion_conditioning.prepare_cache)(
-                input_feature_dict["relp"], z, False
+        if mode != "inference":
+            pred_dict, branch_time_tracker = self._run_inference_for_z(
+                input_feature_dict=input_feature_dict,
+                s_inputs=s_inputs,
+                s=s,
+                z=z,
+                N_cycle=N_cycle,
+                mode=mode,
+                n_sample=N_sample,
+                step_st=step_st,
+                step_trunk=step_trunk,
+                inplace_safe=inplace_safe,
+                chunk_size=chunk_size,
+                diversity_sampler=diversity_sampler,
             )
-            cache["p_lm/c_l"] = autocasting_disable_decorator(
-                self.configs.skip_amp.sample_diffusion
-            )(self.diffusion_module.atom_attention_encoder.prepare_cache)(
-                ref_pos=input_feature_dict["ref_pos"],
-                ref_charge=input_feature_dict["ref_charge"],
-                ref_mask=input_feature_dict["ref_mask"],
-                ref_element=input_feature_dict["ref_element"],
-                ref_atom_name_chars=input_feature_dict["ref_atom_name_chars"],
+            time_tracker.update(branch_time_tracker)
+
+            if label_dict is not None and symmetric_permutation is not None:
+                perm_start = time.time()
+                pred_dict, log_dict = symmetric_permutation.permute_inference_pred_dict(
+                    input_feature_dict=input_feature_dict,
+                    pred_dict=pred_dict,
+                    label_dict=label_dict,
+                    permute_by_pocket=("pocket_mask" in label_dict)
+                    and ("interested_ligand_mask" in label_dict),
+                )
+                time_tracker.update({"permutation": time.time() - perm_start})
+
+            if label_dict is None:
+                interested_atom_mask = None
+            else:
+                interested_atom_mask = label_dict.get("interested_ligand_mask", None)
+            (
+                pred_dict["summary_confidence"],
+                pred_dict["full_data"],
+            ) = autocasting_disable_decorator(True)(
+                sample_confidence.compute_full_data_and_summary
+            )(
+                configs=self.configs,
+                pae_logits=pred_dict["pae"],
+                plddt_logits=pred_dict["plddt"],
+                pde_logits=pred_dict["pde"],
+                contact_probs=pred_dict.get(
+                    "per_sample_contact_probs", pred_dict["contact_probs"]
+                ),
+                token_asym_id=input_feature_dict["asym_id"],
+                token_has_frame=input_feature_dict["has_frame"],
+                atom_coordinate=pred_dict["coordinate"],
                 atom_to_token_idx=input_feature_dict["atom_to_token_idx"],
-                d_lm=input_feature_dict["d_lm"],
-                v_lm=input_feature_dict["v_lm"],
-                pad_info=input_feature_dict["pad_info"],
-                r_l=True,
-                z=cache["pair_z"],
-                inplace_safe=False,
+                atom_is_polymer=1 - input_feature_dict["is_ligand"],
+                N_recycle=N_cycle,
+                interested_atom_mask=interested_atom_mask,
+                return_full_data=True,
+                mol_id=input_feature_dict["mol_id"],
+                elements_one_hot=input_feature_dict["ref_element"],
             )
+            return pred_dict, log_dict, time_tracker
+        proposal_data = self._get_cross_pair_proposal_data(z, input_feature_dict)
+        if proposal_data is None:
+            pred_dict, branch_time_tracker = self._run_inference_for_z(
+                input_feature_dict=input_feature_dict,
+                s_inputs=s_inputs,
+                s=s,
+                z=z,
+                N_cycle=N_cycle,
+                mode=mode,
+                n_sample=N_sample,
+                step_st=step_st,
+                step_trunk=step_trunk,
+                inplace_safe=inplace_safe,
+                chunk_size=chunk_size,
+                diversity_sampler=diversity_sampler,
+            )
+            time_tracker.update(branch_time_tracker)
         else:
-            cache["pair_z"] = None
-            cache["p_lm/c_l"] = [None, None]
-        pred_dict["coordinate"] = self.sample_diffusion(
-            denoise_net=self.diffusion_module,
-            input_feature_dict=input_feature_dict,
-            s_inputs=s_inputs,
-            s_trunk=s,
-            z_trunk=None if cache["pair_z"] is not None else z,
-            pair_z=cache["pair_z"],
-            p_lm=cache["p_lm/c_l"][0],
-            c_l=cache["p_lm/c_l"][1],
-            N_sample=N_sample,
-            noise_schedule=noise_schedule,
-            inplace_safe=inplace_safe,
-            enable_efficient_fusion=self.enable_efficient_fusion,
-            diversity_sampler = diversity_sampler
-        )
+            proposal_scores = proposal_data["probs"].mean(dim=(-1, -2))
+            n_head = proposal_scores.size(0)
+            num_active_heads = min(n_head, N_sample)
+            top_ids = torch.argsort(proposal_scores, descending=True)[:num_active_heads]
+            base_samples = N_sample // num_active_heads
+            residual = N_sample % num_active_heads
 
-        step_diffusion = time.time()
-        time_tracker.update({"diffusion": step_diffusion - step_trunk})
-        # Distogram logits: log contact_probs only, to reduce the dimension
-        pred_dict["contact_probs"] = autocasting_disable_decorator(True)(
-            sample_confidence.compute_contact_prob
-        )(
-            distogram_logits=self.distogram_head(z),
-            **sample_confidence.get_bin_params(self.configs.loss.distogram),
-        )  # [N_token, N_token]
+            merged_pred = {}
+            merged_time = {}
+            all_proposal_ids = []
+            pred_chunks = []
+            for rank, head_idx in enumerate(top_ids.tolist()):
+                cur_n_sample = base_samples + int(rank < residual)
+                if cur_n_sample == 0:
+                    continue
+                z_k = self._inject_cross_pair_delta(
+                    z=z,
+                    prot_idx=proposal_data["prot_idx"],
+                    rna_idx=proposal_data["rna_idx"],
+                    delta_pr=proposal_data["delta_pr"][head_idx],
+                    delta_rp=proposal_data["delta_rp"][head_idx],
+                )
+                pred_k, time_k = self._run_inference_for_z(
+                    input_feature_dict=input_feature_dict,
+                    s_inputs=s_inputs,
+                    s=s,
+                    z=z_k,
+                    N_cycle=N_cycle,
+                    mode=mode,
+                    n_sample=cur_n_sample,
+                    step_st=step_st,
+                    step_trunk=step_trunk,
+                    inplace_safe=inplace_safe,
+                    chunk_size=chunk_size,
+                    diversity_sampler=diversity_sampler,
+                )
+                pred_chunks.append(pred_k)
+                all_proposal_ids.extend([head_idx] * cur_n_sample)
+                merged_time = time_k
 
-        # Confidence logits
-        (
-            pred_dict["plddt"],
-            pred_dict["pae"],
-            pred_dict["pde"],
-            pred_dict["resolved"],
-        ) = self.run_confidence_head(
-            input_feature_dict=input_feature_dict,
-            s_inputs=s_inputs,
-            s_trunk=s,
-            z_trunk=z,
-            pair_mask=None,
-            x_pred_coords=pred_dict["coordinate"],
-            triangle_multiplicative=self.configs.triangle_multiplicative,
-            triangle_attention=self.configs.triangle_attention,
-            inplace_safe=inplace_safe,
-            chunk_size=chunk_size,
-        )
-
-        step_confidence = time.time()
-        time_tracker.update({"confidence": step_confidence - step_diffusion})
-        time_tracker.update({"model_forward": time.time() - step_st})
+            pred_dict["coordinate"] = torch.cat(
+                [chunk["coordinate"] for chunk in pred_chunks], dim=0
+            )
+            pred_dict["plddt"] = torch.cat([chunk["plddt"] for chunk in pred_chunks], dim=0)
+            pred_dict["pae"] = torch.cat([chunk["pae"] for chunk in pred_chunks], dim=0)
+            pred_dict["pde"] = torch.cat([chunk["pde"] for chunk in pred_chunks], dim=0)
+            pred_dict["resolved"] = torch.cat(
+                [chunk["resolved"] for chunk in pred_chunks], dim=0
+            )
+            pred_dict["per_sample_contact_probs"] = torch.cat(
+                [chunk["per_sample_contact_probs"] for chunk in pred_chunks], dim=0
+            )
+            pred_dict["contact_probs"] = pred_chunks[0]["contact_probs"]
+            pred_dict["summary_confidence"] = sum(
+                [chunk["summary_confidence"] for chunk in pred_chunks], []
+            )
+            pred_dict["full_data"] = sum([chunk["full_data"] for chunk in pred_chunks], [])
+            pred_dict["cross_pair_head_ids"] = torch.tensor(
+                all_proposal_ids, device=z.device, dtype=torch.long
+            )
+            pred_dict["cross_pair_logits"] = proposal_data["logits"]
+            time_tracker.update(merged_time)
 
         # Permutation: when label is given, permute coordinates and other heads
         if label_dict is not None and symmetric_permutation is not None:
@@ -616,39 +891,6 @@ class Protenix(nn.Module):
             )
             last_step_seconds = step_confidence
             time_tracker.update({"permutation": time.time() - last_step_seconds})
-
-        # Summary Confidence & Full Data
-        # Computed after coordinates and logits are permuted
-        if label_dict is None:
-            interested_atom_mask = None
-        else:
-            interested_atom_mask = label_dict.get("interested_ligand_mask", None)
-        (
-            pred_dict["summary_confidence"],
-            pred_dict["full_data"],
-        ) = autocasting_disable_decorator(True)(
-            sample_confidence.compute_full_data_and_summary
-        )(
-            configs=self.configs,
-            pae_logits=pred_dict["pae"],
-            plddt_logits=pred_dict["plddt"],
-            pde_logits=pred_dict["pde"],
-            contact_probs=pred_dict.get(
-                "per_sample_contact_probs", pred_dict["contact_probs"]
-            ),
-            token_asym_id=input_feature_dict["asym_id"],
-            token_has_frame=input_feature_dict["has_frame"],
-            atom_coordinate=pred_dict["coordinate"],
-            atom_to_token_idx=input_feature_dict["atom_to_token_idx"],
-            atom_is_polymer=1 - input_feature_dict["is_ligand"],
-            N_recycle=N_cycle,
-            interested_atom_mask=interested_atom_mask,
-            return_full_data=True,
-            mol_id=(input_feature_dict["mol_id"] if mode != "inference" else None),
-            elements_one_hot=(
-                input_feature_dict["ref_element"] if mode != "inference" else None
-            ),
-        )
 
         return pred_dict, log_dict, time_tracker
 
@@ -689,32 +931,30 @@ class Protenix(nn.Module):
         log_dict = {}
         pred_dict = {}
 
-        cache = dict()
-        if self.enable_diffusion_shared_vars_cache:
-            cache["pair_z"] = autocasting_disable_decorator(
-                self.configs.skip_amp.sample_diffusion
-            )(self.diffusion_module.diffusion_conditioning.prepare_cache)(
-                input_feature_dict["relp"], z, False
+        proposal_data = self._get_cross_pair_proposal_data(z, input_feature_dict)
+        pred_dict["cross_pair_logits"] = (
+            proposal_data["logits"] if proposal_data is not None else None
+        )
+        selected_head_idx, target_contact_dict = self._select_training_cross_pair_head(
+            proposal_data=proposal_data,
+            feat_dict=input_feature_dict,
+            label_dict=label_dict,
+        )
+        if selected_head_idx is not None:
+            z = self._inject_cross_pair_delta(
+                z=z,
+                prot_idx=proposal_data["prot_idx"],
+                rna_idx=proposal_data["rna_idx"],
+                delta_pr=proposal_data["delta_pr"][selected_head_idx],
+                delta_rp=proposal_data["delta_rp"][selected_head_idx],
             )
-            cache["p_lm/c_l"] = autocasting_disable_decorator(
-                self.configs.skip_amp.sample_diffusion
-            )(self.diffusion_module.atom_attention_encoder.prepare_cache)(
-                ref_pos=input_feature_dict["ref_pos"],
-                ref_charge=input_feature_dict["ref_charge"],
-                ref_mask=input_feature_dict["ref_mask"],
-                ref_element=input_feature_dict["ref_element"],
-                ref_atom_name_chars=input_feature_dict["ref_atom_name_chars"],
-                atom_to_token_idx=input_feature_dict["atom_to_token_idx"],
-                d_lm=input_feature_dict["d_lm"],
-                v_lm=input_feature_dict["v_lm"],
-                pad_info=input_feature_dict["pad_info"],
-                r_l=True,
-                z=cache["pair_z"],
-                inplace_safe=False,
+            pred_dict["cross_pair_selected_idx"] = torch.tensor(
+                selected_head_idx, device=z.device, dtype=torch.long
             )
-        else:
-            cache["pair_z"] = None
-            cache["p_lm/c_l"] = [None, None]
+            pred_dict["cross_pair_target"] = target_contact_dict["target"]
+            pred_dict["cross_pair_valid_mask"] = target_contact_dict["pair_valid_mask"]
+
+        cache = self._prepare_diffusion_cache(input_feature_dict, z)
         # Mini-rollout: used for confidence and label permutation
         with torch.no_grad():
             # [..., 1, N_atom, 3]

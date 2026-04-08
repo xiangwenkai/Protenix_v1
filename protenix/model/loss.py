@@ -20,6 +20,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from protenix.metrics.rmsd import weighted_rigid_align
+from protenix.model.modules.cross_pair_proposal import (
+    build_cross_pair_target_contact_map,
+    compute_diversity_margin_loss,
+    compute_per_head_contact_losses,
+)
 from protenix.model.modules.frames import (
     expressCoordinatesInFrame,
     gather_frame_atom_by_indices,
@@ -1439,6 +1444,78 @@ class PLDDTLoss(nn.Module):
         return loss
 
 
+class CrossPairProposalLoss(nn.Module):
+    """Coverage + diversity loss for the K-way cross-pair proposal module."""
+
+    def __init__(
+        self,
+        contact_threshold: float = 8.0,
+        dice_weight: float = 1.0,
+        diversity_margin: float = 0.5,
+        diversity_weight: float = 0.2,
+        softmin_temperature: float = 0.1,
+        eps: float = 1e-6,
+    ) -> None:
+        super(CrossPairProposalLoss, self).__init__()
+        self.contact_threshold = contact_threshold
+        self.dice_weight = dice_weight
+        self.diversity_margin = diversity_margin
+        self.diversity_weight = diversity_weight
+        self.softmin_temperature = softmin_temperature
+        self.eps = eps
+
+    def forward(
+        self,
+        feat_dict: dict[str, Any],
+        pred_dict: dict[str, torch.Tensor],
+        label_dict: dict[str, Any],
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        logits = pred_dict.get("cross_pair_logits")
+        if logits is None:
+            zero = label_dict["coordinate"].new_zeros(())
+            return zero, {
+                "coverage": zero.detach(),
+                "diversity": zero.detach(),
+            }
+
+        target_dict = build_cross_pair_target_contact_map(
+            feat_dict=feat_dict,
+            label_dict=label_dict,
+            contact_threshold=self.contact_threshold,
+        )
+        if target_dict is None:
+            zero = logits.new_zeros(())
+            return zero, {
+                "coverage": zero.detach(),
+                "diversity": zero.detach(),
+            }
+
+        per_head = compute_per_head_contact_losses(
+            logits=logits,
+            target=target_dict["target"],
+            pair_valid_mask=target_dict["pair_valid_mask"],
+            dice_weight=self.dice_weight,
+            eps=self.eps,
+        )
+        coverage_loss = -self.softmin_temperature * torch.logsumexp(
+            -per_head / self.softmin_temperature,
+            dim=0,
+        )
+        diversity_loss = compute_diversity_margin_loss(
+            probs=torch.sigmoid(logits),
+            margin=self.diversity_margin,
+            eps=self.eps,
+        )
+        total_loss = coverage_loss + self.diversity_weight * diversity_loss
+        metrics = {
+            "coverage": coverage_loss.detach(),
+            "diversity": diversity_loss.detach(),
+            "head_best": per_head.min().detach(),
+            "head_mean": per_head.mean().detach(),
+        }
+        return total_loss, metrics
+
+
 class ProtenixLoss(nn.Module):
     """Aggregation of the various losses"""
 
@@ -1453,6 +1530,7 @@ class ProtenixLoss(nn.Module):
         self.alpha_distogram = self.configs.loss.weight.alpha_distogram
         self.alpha_bond = self.configs.loss.weight.alpha_bond
         self.weight_smooth_lddt = self.configs.loss.weight.smooth_lddt
+        self.alpha_cross_pair = self.configs.loss.weight.alpha_cross_pair
 
         self.lddt_radius = {
             "is_nucleotide_threshold": 30.0,
@@ -1472,6 +1550,8 @@ class ProtenixLoss(nn.Module):
             * self.weight_smooth_lddt,  # Different from AF3 appendix eq(6), where smooth_lddt has no weight
             # distogram
             "distogram_loss": self.alpha_distogram,
+            # proposal
+            "cross_pair_loss": self.alpha_cross_pair,
         }
 
         # Loss
@@ -1483,6 +1563,9 @@ class ProtenixLoss(nn.Module):
         self.bond_loss = BondLoss(**configs.loss.diffusion.bond)
         self.smooth_lddt_loss = SmoothLDDTLoss(**configs.loss.diffusion.smooth_lddt)
         self.distogram_loss = DistogramLoss(**configs.loss.distogram)
+        self.cross_pair_proposal_loss = CrossPairProposalLoss(
+            **configs.loss.cross_pair_proposal
+        )
 
     def calculate_label(
         self,
@@ -1726,6 +1809,16 @@ class ProtenixLoss(nn.Module):
                             true_coordinate=label_dict["coordinate"],
                             coordinate_mask=label_dict["coordinate_mask"],
                             rep_atom_mask=feat_dict["distogram_rep_atom_mask"],
+                        )
+                    }
+                )
+            if pred_dict.get("cross_pair_logits") is not None:
+                loss_fns.update(
+                    {
+                        "cross_pair_loss": lambda: self.cross_pair_proposal_loss(
+                            feat_dict=feat_dict,
+                            pred_dict=pred_dict,
+                            label_dict=label_dict,
                         )
                     }
                 )
