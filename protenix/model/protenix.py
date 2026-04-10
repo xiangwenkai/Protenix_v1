@@ -400,6 +400,8 @@ class Protenix(nn.Module):
         delta_rp: torch.Tensor,
     ) -> torch.Tensor:
         z_mod = z.clone()
+        delta_pr = delta_pr.to(dtype=z_mod.dtype, device=z_mod.device)
+        delta_rp = delta_rp.to(dtype=z_mod.dtype, device=z_mod.device)
         z_mod[prot_idx[:, None], rna_idx[None, :], :] = (
             z_mod[prot_idx[:, None], rna_idx[None, :], :] + delta_pr
         )
@@ -459,6 +461,7 @@ class Protenix(nn.Module):
             target=target_dict["target"],
             pair_valid_mask=target_dict["pair_valid_mask"],
             dice_weight=self.configs.loss.cross_pair_proposal.dice_weight,
+            pos_weight=self.configs.loss.cross_pair_proposal.pos_weight,
             eps=self.configs.loss.cross_pair_proposal.eps,
         )
         selected_idx = int(per_head_loss.argmin().item())
@@ -473,10 +476,16 @@ class Protenix(nn.Module):
         z_branch: torch.Tensor,
         use_conditioning: bool,
         inplace_safe: bool,
+        diffusion_batch_size: Optional[int] = None,
         compute_confidence: bool = False,
     ) -> dict[str, Any]:
         branch_pred = {}
         cache = self._prepare_diffusion_cache(input_feature_dict, z_branch)
+        n_sample = (
+            self.diffusion_batch_size
+            if diffusion_batch_size is None
+            else diffusion_batch_size
+        )
         _, x_denoised, x_noise_level = autocasting_disable_decorator(
             self.configs.skip_amp.sample_diffusion_training
         )(sample_diffusion_training)(
@@ -490,7 +499,7 @@ class Protenix(nn.Module):
             pair_z=cache["pair_z"],
             p_lm=cache["p_lm/c_l"][0],
             c_l=cache["p_lm/c_l"][1],
-            N_sample=self.diffusion_batch_size,
+            N_sample=n_sample,
             diffusion_chunk_size=self.configs.diffusion_chunk_size,
             use_conditioning=use_conditioning,
             enable_efficient_fusion=self.enable_efficient_fusion,
@@ -1180,6 +1189,9 @@ class Protenix(nn.Module):
                 delta_pr=proposal_data["delta_pr"][random_head_idx],
                 delta_rp=proposal_data["delta_rp"][random_head_idx],
             )
+            random_branch_need_confidence = (
+                self.configs.loss.weight.alpha_cross_pair_quality > 0.0
+            )
             random_branch_pred = self._run_training_diffusion_branch(
                 input_feature_dict=input_feature_dict,
                 label_dict=label_dict,
@@ -1188,25 +1200,31 @@ class Protenix(nn.Module):
                 z_branch=z_random,
                 use_conditioning=not drop_conditioning,
                 inplace_safe=inplace_safe,
-                compute_confidence=True,
+                diffusion_batch_size=self.configs.model.cross_pair_proposal.random_branch_diffusion_batch_size,
+                compute_confidence=random_branch_need_confidence,
             )
             pred_dict.update(
                 {
                     "coordinate_random_head": random_branch_pred["coordinate"],
                     "noise_level_random_head": random_branch_pred["noise_level"],
                     "distogram_random_head": random_branch_pred["distogram"],
-                    "plddt_random_head": random_branch_pred["plddt"],
-                    "pae_random_head": random_branch_pred["pae"],
-                    "pde_random_head": random_branch_pred["pde"],
-                    "resolved_random_head": random_branch_pred["resolved"],
-                    "summary_confidence_scores_random_head": random_branch_pred[
-                        "summary_confidence_scores"
-                    ],
                     "cross_pair_random_head_idx": torch.tensor(
                         random_head_idx, device=z.device, dtype=torch.long
                     ),
                 }
             )
+            if random_branch_need_confidence:
+                pred_dict.update(
+                    {
+                        "plddt_random_head": random_branch_pred["plddt"],
+                        "pae_random_head": random_branch_pred["pae"],
+                        "pde_random_head": random_branch_pred["pde"],
+                        "resolved_random_head": random_branch_pred["resolved"],
+                        "summary_confidence_scores_random_head": random_branch_pred[
+                            "summary_confidence_scores"
+                        ],
+                    }
+                )
 
         # Permute symmetric atom/chain in each sample to match true structure
         # Note: currently chains cannot be permuted since label is cropped

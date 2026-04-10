@@ -1451,16 +1451,22 @@ class CrossPairProposalLoss(nn.Module):
         self,
         contact_threshold: float = 8.0,
         dice_weight: float = 1.0,
+        pos_weight: float = 1.0,
         diversity_margin: float = 0.5,
         diversity_weight: float = 0.2,
+        diversity_confidence_margin: float = 0.25,
+        diversity_ambiguity_weight: float = 1.0,
         softmin_temperature: float = 0.1,
         eps: float = 1e-6,
     ) -> None:
         super(CrossPairProposalLoss, self).__init__()
         self.contact_threshold = contact_threshold
         self.dice_weight = dice_weight
+        self.pos_weight = pos_weight
         self.diversity_margin = diversity_margin
         self.diversity_weight = diversity_weight
+        self.diversity_confidence_margin = diversity_confidence_margin
+        self.diversity_ambiguity_weight = diversity_ambiguity_weight
         self.softmin_temperature = softmin_temperature
         self.eps = eps
 
@@ -1495,6 +1501,7 @@ class CrossPairProposalLoss(nn.Module):
             target=target_dict["target"],
             pair_valid_mask=target_dict["pair_valid_mask"],
             dice_weight=self.dice_weight,
+            pos_weight=self.pos_weight,
             eps=self.eps,
         )
         coverage_loss = -self.softmin_temperature * torch.logsumexp(
@@ -1502,8 +1509,10 @@ class CrossPairProposalLoss(nn.Module):
             dim=0,
         )
         diversity_loss = compute_diversity_margin_loss(
-            probs=torch.sigmoid(logits),
+            logits=logits,
             margin=self.diversity_margin,
+            confidence_margin=self.diversity_confidence_margin,
+            ambiguity_weight=self.diversity_ambiguity_weight,
             eps=self.eps,
         )
         total_loss = coverage_loss + self.diversity_weight * diversity_loss
@@ -1523,12 +1532,14 @@ class CrossPairBalanceLoss(nn.Module):
         self,
         contact_threshold: float = 8.0,
         dice_weight: float = 1.0,
+        pos_weight: float = 1.0,
         softmax_temperature: float = 0.1,
         eps: float = 1e-6,
     ) -> None:
         super(CrossPairBalanceLoss, self).__init__()
         self.contact_threshold = contact_threshold
         self.dice_weight = dice_weight
+        self.pos_weight = pos_weight
         self.softmax_temperature = softmax_temperature
         self.eps = eps
 
@@ -1557,6 +1568,7 @@ class CrossPairBalanceLoss(nn.Module):
             target=target_dict["target"],
             pair_valid_mask=target_dict["pair_valid_mask"],
             dice_weight=self.dice_weight,
+            pos_weight=self.pos_weight,
             eps=self.eps,
         )
         assignment = torch.softmax(-per_head / self.softmax_temperature, dim=0)
@@ -1689,6 +1701,7 @@ class ProtenixLoss(nn.Module):
         self.cross_pair_balance_loss = CrossPairBalanceLoss(
             contact_threshold=configs.loss.cross_pair_proposal.contact_threshold,
             dice_weight=configs.loss.cross_pair_proposal.dice_weight,
+            pos_weight=configs.loss.cross_pair_proposal.pos_weight,
             softmax_temperature=configs.loss.cross_pair_balance.softmax_temperature,
             eps=configs.loss.cross_pair_balance.eps,
         )

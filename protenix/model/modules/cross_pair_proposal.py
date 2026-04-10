@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from typing import Optional
 
 import torch
@@ -105,6 +106,7 @@ def compute_per_head_contact_losses(
     target: torch.Tensor,
     pair_valid_mask: Optional[torch.Tensor] = None,
     dice_weight: float = 1.0,
+    pos_weight: float = 1.0,
     eps: float = 1e-6,
 ) -> torch.Tensor:
     """Per-head proposal loss used for head selection and coverage loss."""
@@ -118,8 +120,9 @@ def compute_per_head_contact_losses(
         if pair_valid_mask.dim() == 2:
             pair_valid_mask = pair_valid_mask.unsqueeze(0).expand_as(logits)
 
+    pos_weight_tensor = logits.new_tensor(pos_weight)
     bce = F.binary_cross_entropy_with_logits(
-        logits, target, reduction="none"
+        logits, target, reduction="none", pos_weight=pos_weight_tensor
     )
     bce = (bce * pair_valid_mask).sum(dim=(-1, -2)) / (
         pair_valid_mask.sum(dim=(-1, -2)) + eps
@@ -133,20 +136,39 @@ def compute_per_head_contact_losses(
 
 
 def compute_diversity_margin_loss(
-    probs: torch.Tensor,
+    logits: torch.Tensor,
     margin: float,
+    confidence_margin: float = 0.25,
+    ambiguity_weight: float = 1.0,
     eps: float = 1e-6,
 ) -> torch.Tensor:
-    """Penalize near-duplicate proposals."""
-    n_head = probs.shape[0]
+    """
+    Penalize near-duplicate proposals and strongly penalize inactive proposals
+    whose contact probabilities collapse toward zero.
+    """
+    n_head = logits.shape[0]
     if n_head <= 1:
-        return probs.new_zeros(())
-    flat = probs.reshape(n_head, -1).float()
-    flat = flat / (flat.norm(dim=-1, keepdim=True) + eps)
-    pairwise = torch.cdist(flat, flat, p=2)
+        return logits.new_zeros(())
+
+    probs = torch.sigmoid(logits).float()
+    flat = probs.reshape(n_head, -1)
+    flat_norm = flat / (flat.norm(dim=-1, keepdim=True) + eps)
+    pairwise = torch.cdist(flat_norm, flat_norm, p=2)
     upper = torch.triu_indices(n_head, n_head, offset=1, device=probs.device)
     pairwise = pairwise[upper[0], upper[1]]
-    return torch.relu(margin - pairwise).mean()
+    duplicate_loss = torch.relu(margin - pairwise).mean()
+
+    # Sparse contact maps should not be penalized just because the global mean
+    # probability is small. Instead, require that each head has at least a small
+    # set of confident contact candidates. If even the top-scoring entries are
+    # near zero, the proposal has effectively collapsed to the all-negative mode.
+    topk = min(max(flat.shape[-1] // 100, 1), 64)
+    topk_mean_prob = flat.topk(k=topk, dim=-1).values.mean(dim=-1)
+    normalized_activity = topk_mean_prob / max(confidence_margin, eps)
+    ambiguity_loss = -torch.log(normalized_activity.clamp_min(eps))
+    ambiguity_loss = torch.relu(ambiguity_loss).mean()
+
+    return duplicate_loss + ambiguity_weight * ambiguity_loss
 
 
 class KWayCrossPairProposal(nn.Module):
@@ -161,7 +183,10 @@ class KWayCrossPairProposal(nn.Module):
         c_z: int = 128,
         hidden_dim: int = 128,
         num_heads: int = 4,
+        slot_attn_heads: int = 4,
         delta_scale: float = 1.0,
+        gate_floor: float = 0.0,
+        random_branch_diffusion_batch_size: int = 8,
         contact_threshold: float = 8.0,
         enable: bool = False,
     ) -> None:
@@ -169,25 +194,54 @@ class KWayCrossPairProposal(nn.Module):
         self.c_z = c_z
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
+        self.slot_attn_heads = slot_attn_heads
         self.delta_scale = delta_scale
+        self.gate_floor = gate_floor
+        self.random_branch_diffusion_batch_size = random_branch_diffusion_batch_size
         self.contact_threshold = contact_threshold
         self.enable = enable
 
         self.input_ln = nn.LayerNorm(c_z)
+        # v2.1 residual context encoder:
+        # keep a direct projection path from z_pr while the MLP learns a task-
+        # specific refinement. This avoids the proposal branch shrinking the
+        # signal into an almost-silent representation.
+        self.res_proj = (
+            nn.Identity()
+            if hidden_dim == c_z
+            else nn.Linear(c_z, hidden_dim)
+        )
         self.shared = nn.Sequential(
             nn.Linear(c_z, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
         )
-        # Base head slots provide stable specialization, while the query MLP
-        # makes each head input-conditioned for the current cross-pair pattern.
+        self.context_ln = nn.LayerNorm(hidden_dim)
+        self.context_scale = nn.Parameter(torch.tensor(1.0))
+
+        # v2.2 slot-style input-conditioned proposals:
+        # learned base slots + an input-dependent query initializer, followed by
+        # cross-attention over the cross-pair context map.
         self.head_slots = nn.Parameter(torch.randn(num_heads, hidden_dim))
         self.query_ln = nn.LayerNorm(hidden_dim)
         self.query_mlp = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, num_heads * hidden_dim),
+        )
+        self.slot_query_ln = nn.LayerNorm(hidden_dim)
+        self.slot_kv_ln = nn.LayerNorm(hidden_dim)
+        self.slot_attn = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=slot_attn_heads,
+            batch_first=True,
+        )
+        self.slot_post_ln = nn.LayerNorm(hidden_dim)
+        self.slot_mlp = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
         )
         self.contact_head = nn.Linear(hidden_dim, 1)
         self.delta_head_pr = nn.Linear(hidden_dim, c_z)
@@ -205,20 +259,52 @@ class KWayCrossPairProposal(nn.Module):
             delta_pr: [K, N_protein_token, N_rna_token, c_z]
             delta_rp: [K, N_protein_token, N_rna_token, c_z]
         """
-        h = self.shared(self.input_ln(z_pr))
+        x = self.input_ln(z_pr)
+        h = self.res_proj(z_pr) + self.context_scale * self.shared(x)
+        h = self.context_ln(h)
+        # Match the injected residual to the local pair-feature scale instead of
+        # adding a unit-norm vector whose per-channel amplitude is only
+        # O(1 / sqrt(c_z)). This keeps proposal deltas small but actually visible
+        # to the pretrained pair representation.
+        local_z_rms = z_pr.float().pow(2).mean(dim=-1, keepdim=True).sqrt()
+        local_z_rms = local_z_rms.to(dtype=z_pr.dtype)
+        delta_feature_scale = math.sqrt(self.c_z) * local_z_rms
+
         pooled = h.mean(dim=(0, 1))
         dynamic_queries = self.query_mlp(self.query_ln(pooled)).view(
             self.num_heads, self.hidden_dim
         )
-        head_queries = self.head_slots + dynamic_queries
+        slot_init = self.head_slots + dynamic_queries
+
+        kv = h.reshape(1, -1, self.hidden_dim)
+        slot_input = slot_init.unsqueeze(0)
+        slot_attn_out, _ = self.slot_attn(
+            query=self.slot_query_ln(slot_input),
+            key=self.slot_kv_ln(kv),
+            value=self.slot_kv_ln(kv),
+            need_weights=False,
+        )
+        slots = slot_input + slot_attn_out
+        slots = slots + self.slot_mlp(self.slot_post_ln(slots))
+        head_queries = slots.squeeze(0)
         logits, deltas_pr, deltas_rp = [], [], []
         for head_idx in range(self.num_heads):
             h_k = h + head_queries[head_idx].view(1, 1, -1)
             contact_logits = self.contact_head(h_k).squeeze(-1)
             contact_probs = torch.sigmoid(contact_logits)
-            delta_gate = contact_probs.unsqueeze(-1) * self.delta_scale
-            deltas_pr.append(delta_gate * self.delta_head_pr(h_k))
-            deltas_rp.append(delta_gate * self.delta_head_rp(h_k))
+            delta_gate = (
+                self.gate_floor + (1.0 - self.gate_floor) * contact_probs
+            ).unsqueeze(-1)
+            delta_pr_raw = self.delta_head_pr(h_k)
+            delta_rp_raw = self.delta_head_rp(h_k)
+            delta_pr_unit = F.normalize(delta_pr_raw, p=2, dim=-1, eps=1e-6)
+            delta_rp_unit = F.normalize(delta_rp_raw, p=2, dim=-1, eps=1e-6)
+            deltas_pr.append(
+                delta_gate * self.delta_scale * delta_feature_scale * delta_pr_unit
+            )
+            deltas_rp.append(
+                delta_gate * self.delta_scale * delta_feature_scale * delta_rp_unit
+            )
             logits.append(contact_logits)
         return (
             torch.stack(logits, dim=0),
