@@ -296,7 +296,7 @@ model_configs = {
             "no_bins": GlobalConfigValue("no_bins"),
         },
         "cross_pair_proposal": {
-            "enable": False,
+            "enable": True,
             "c_z": GlobalConfigValue("c_z"),
             "hidden_dim": GlobalConfigValue("c_z"),
             "num_heads": 5,
