@@ -33,6 +33,9 @@ basic_configs = {
     "finetune_params_with_substring": [
         ""
     ],  # params with substring will be finetuned with different learning rate: finetune_optim_configs["lr"]
+    "freeze_params_with_substring": ListValue(
+        [], dtype=str
+    ),  # params with substring will be frozen by setting requires_grad=False before optimizer init
     "eval_only": False,
     "load_checkpoint_path": "",
     "load_ema_checkpoint_path": "",

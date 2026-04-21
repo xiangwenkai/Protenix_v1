@@ -45,6 +45,17 @@
 
 """
 model_configs = {
+    "protenix_base_cpp_v1.0.0": {
+        "model": {
+            "N_cycle": 10,
+            "template_embedder": {
+                "n_blocks": 2,
+            },
+        },
+        "sample_diffusion": {
+            "N_step": 200,
+        },  # the default inference setting for base model
+    },
     "protenix_base_default_v1.0.0": {
         "model": {
             "N_cycle": 10,

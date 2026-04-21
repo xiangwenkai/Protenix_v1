@@ -192,6 +192,7 @@ class AF3Trainer(object):
         Sets up DistributedDataParallel (DDP) if multiple GPUs are used.
         """
         self.raw_model = Protenix(self.configs).to(self.device)
+        self.freeze_model_parameters()
         self.use_ddp = False
         if DIST_WRAPPER.world_size > 1:
             self.print("Using DistributedDataParallel (DDP)")
@@ -230,6 +231,29 @@ class AF3Trainer(object):
             param_names=self.configs.get("finetune_params_with_substring", [""]),
         )
         self.init_scheduler()
+
+    def freeze_model_parameters(self) -> None:
+        """
+        Freeze parameters whose names contain any configured substring.
+        """
+        freeze_names = self.configs.get("freeze_params_with_substring", [])
+        if len(freeze_names) == 0:
+            return
+
+        frozen_param_names = []
+        frozen_param_numel = 0
+        for name, param in self.raw_model.named_parameters():
+            if any(key in name for key in freeze_names):
+                param.requires_grad = False
+                frozen_param_names.append(name)
+                frozen_param_numel += param.numel()
+
+        self.print(
+            f"Frozen {len(frozen_param_names)} parameter tensors "
+            f"({frozen_param_numel:,} parameters) matching {freeze_names}"
+        )
+        if len(frozen_param_names) > 0:
+            self.print(f"Sample frozen params: {frozen_param_names[:5]}")
 
     def init_scheduler(self, **kwargs: Any) -> None:
         """
