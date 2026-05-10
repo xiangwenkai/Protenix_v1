@@ -446,11 +446,20 @@ def update_rna_msa_info(
 
 
 if __name__ == "__main__":
+    seq_id="R1271"
+    seq = "GCGCUGAUGGUCUAGGUGGUUAUGACGUCGCUUUAACACGGCGAAGGUCUCGGGUUCGAGUCCCGAUCGGCGUACCA"
     example_seq = (
-        "GGCGCGUUAACAAAGCGGUUAUGUAGCGGAUUGCAAAUCCGUCUAGUCCGGUUCGACUCCGGAACGCGCCUCCA"
+        seq
     )
+
+    PROTENIX_ROOT_DIR = os.environ.get("PROTENIX_ROOT_DIR", "/inspire/ssd/project/sais-bio/public/Protein/data/AI_Models/protenix_v1_dataset")
+    
     run_rna_msa_search(
-        rna_seq_for_msa_search=example_seq,
+        rna_seq_for_msa_search=seq,
         rna_result_path="./output",
-        rna_seq_id="rna_seq_1",
+        rna_seq_id=seq_id,
+        ntrna_database_path = f"{PROTENIX_ROOT_DIR}/search_database/nt_rna_2023_02_23_clust_seq_id_90_cov_80_rep_seq.fasta",
+        rfam_database_path = f"{PROTENIX_ROOT_DIR}/search_database/rfam_14_9_clust_seq_id_90_cov_80_rep_seq.fasta",
+        rna_central_database_path = f"{PROTENIX_ROOT_DIR}/search_database/rnacentral_active_seq_id_90_cov_80_linclust.fasta",
+        nhmmer_n_cpu=8
     )

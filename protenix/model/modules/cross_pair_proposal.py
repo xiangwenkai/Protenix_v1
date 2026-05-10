@@ -171,6 +171,33 @@ def compute_diversity_margin_loss(
     return duplicate_loss + ambiguity_weight * ambiguity_loss
 
 
+def build_regular_simplex_slots(
+    num_heads: int,
+    hidden_dim: int,
+    *,
+    device: Optional[torch.device] = None,
+    dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    """
+    Build approximately uniform head prototypes by embedding the vertices of a
+    regular simplex into ``hidden_dim`` dimensions and L2-normalizing them.
+    """
+    if num_heads <= 0 or hidden_dim <= 0:
+        raise ValueError("num_heads and hidden_dim must be positive")
+    if num_heads == 1:
+        return torch.ones((1, hidden_dim), device=device, dtype=dtype)
+
+    base = torch.eye(num_heads, dtype=torch.float32)
+    base = base - base.mean(dim=0, keepdim=True)
+    u, s, _ = torch.linalg.svd(base, full_matrices=False)
+    rank = min(hidden_dim, num_heads - 1)
+    coords = u[:, :rank] * s[:rank]
+    if hidden_dim > rank:
+        coords = F.pad(coords, (0, hidden_dim - rank))
+    coords = F.normalize(coords, p=2, dim=-1, eps=1e-6)
+    return coords.to(device=device, dtype=dtype)
+
+
 class KWayCrossPairProposal(nn.Module):
     """
     Generate K alternative protein-RNA cross-pair proposals from the trunk pair
@@ -185,6 +212,8 @@ class KWayCrossPairProposal(nn.Module):
         num_heads: int = 4,
         slot_attn_heads: int = 4,
         delta_scale: float = 1.0,
+        head_slot_init: str = "random",
+        head_slot_init_scale: float = 1.0,
         gate_floor: float = 0.0,
         random_branch_diffusion_batch_size: int = 8,
         contact_threshold: float = 8.0,
@@ -196,6 +225,8 @@ class KWayCrossPairProposal(nn.Module):
         self.num_heads = num_heads
         self.slot_attn_heads = slot_attn_heads
         self.delta_scale = delta_scale
+        self.head_slot_init = head_slot_init
+        self.head_slot_init_scale = head_slot_init_scale
         self.gate_floor = gate_floor
         self.random_branch_diffusion_batch_size = random_branch_diffusion_batch_size
         self.contact_threshold = contact_threshold
@@ -223,7 +254,7 @@ class KWayCrossPairProposal(nn.Module):
         # v2.2 slot-style input-conditioned proposals:
         # learned base slots + an input-dependent query initializer, followed by
         # cross-attention over the cross-pair context map.
-        self.head_slots = nn.Parameter(torch.randn(num_heads, hidden_dim))
+        self.head_slots = nn.Parameter(torch.empty(num_heads, hidden_dim))
         self.query_ln = nn.LayerNorm(hidden_dim)
         self.query_mlp = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
@@ -244,20 +275,87 @@ class KWayCrossPairProposal(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
         )
         self.contact_head = nn.Linear(hidden_dim, 1)
+        # Pair-local head bias: each head now produces a position-dependent bias
+        # map instead of a single scalar offset for the whole contact matrix.
+        self.contact_pair_bias_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.contact_pair_bias_ln = nn.LayerNorm(hidden_dim)
+        self.contact_head_bias_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.contact_head_bias_ln = nn.LayerNorm(hidden_dim)
+        self.delta_pair_pr_proj = nn.Linear(hidden_dim, c_z, bias=False)
+        self.delta_pair_pr_ln = nn.LayerNorm(c_z)
+        self.delta_head_pr_proj = nn.Linear(hidden_dim, c_z, bias=False)
+        self.delta_head_pr_ln = nn.LayerNorm(c_z)
+        self.delta_pair_rp_proj = nn.Linear(hidden_dim, c_z, bias=False)
+        self.delta_pair_rp_ln = nn.LayerNorm(c_z)
+        self.delta_head_rp_proj = nn.Linear(hidden_dim, c_z, bias=False)
+        self.delta_head_rp_ln = nn.LayerNorm(c_z)
         self.delta_head_pr = nn.Linear(hidden_dim, c_z)
         self.delta_head_rp = nn.Linear(hidden_dim, c_z)
+        self._reset_head_slots()
+
+    def _reset_head_slots(self) -> None:
+        mode = self.head_slot_init.lower()
+        scale = float(self.head_slot_init_scale)
+        with torch.no_grad():
+            if mode == "random":
+                nn.init.normal_(self.head_slots, mean=0.0, std=scale)
+                return
+
+            if mode == "orthogonal":
+                if self.num_heads > self.hidden_dim:
+                    raise ValueError(
+                        "orthogonal head slot init requires num_heads <= hidden_dim"
+                    )
+                basis = torch.randn(
+                    self.hidden_dim,
+                    self.num_heads,
+                    device=self.head_slots.device,
+                    dtype=torch.float32,
+                )
+                slots, _ = torch.linalg.qr(basis, mode="reduced")
+                slots = slots.transpose(0, 1)
+            elif mode == "simplex":
+                slots = build_regular_simplex_slots(
+                    num_heads=self.num_heads,
+                    hidden_dim=self.hidden_dim,
+                    device=self.head_slots.device,
+                    dtype=torch.float32,
+                )
+            else:
+                raise ValueError(
+                    f"Unsupported head_slot_init: {self.head_slot_init}. "
+                    "Expected one of {'random', 'orthogonal', 'simplex'}."
+                )
+
+            self.head_slots.copy_(scale * slots.to(dtype=self.head_slots.dtype))
+
+    def _compute_pair_local_head_contact_bias(
+        self,
+        pair_contact_bias: torch.Tensor,
+        head_contact_bias: torch.Tensor,
+    ) -> torch.Tensor:
+        return torch.einsum(
+            "prc,kc->kpr", pair_contact_bias, head_contact_bias
+        ) / math.sqrt(self.hidden_dim)
+
+    def _compute_pair_local_delta_shift(
+        self,
+        pair_delta_bias: torch.Tensor,
+        head_delta_bias: torch.Tensor,
+    ) -> torch.Tensor:
+        return pair_delta_bias.unsqueeze(0) * head_delta_bias[:, None, None, :]
 
     def forward(
         self, z_pr: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """
         Args:
             z_pr: [N_protein_token, N_rna_token, c_z]
 
         Returns:
             contact_logits: [K, N_protein_token, N_rna_token]
-            delta_pr: [K, N_protein_token, N_rna_token, c_z]
-            delta_rp: [K, N_protein_token, N_rna_token, c_z]
+            proposal_state: lightweight state used to lazily decode deltas only
+                for the selected heads.
         """
         x = self.input_ln(z_pr)
         h = self.res_proj(z_pr) + self.context_scale * self.shared(x)
@@ -287,27 +385,106 @@ class KWayCrossPairProposal(nn.Module):
         slots = slot_input + slot_attn_out
         slots = slots + self.slot_mlp(self.slot_post_ln(slots))
         head_queries = slots.squeeze(0)
-        logits, deltas_pr, deltas_rp = [], [], []
-        for head_idx in range(self.num_heads):
-            h_k = h + head_queries[head_idx].view(1, 1, -1)
-            contact_logits = self.contact_head(h_k).squeeze(-1)
-            contact_probs = torch.sigmoid(contact_logits)
-            delta_gate = (
-                self.gate_floor + (1.0 - self.gate_floor) * contact_probs
-            ).unsqueeze(-1)
-            delta_pr_raw = self.delta_head_pr(h_k)
-            delta_rp_raw = self.delta_head_rp(h_k)
-            delta_pr_unit = F.normalize(delta_pr_raw, p=2, dim=-1, eps=1e-6)
-            delta_rp_unit = F.normalize(delta_rp_raw, p=2, dim=-1, eps=1e-6)
-            deltas_pr.append(
-                delta_gate * self.delta_scale * delta_feature_scale * delta_pr_unit
+        base_contact_logits = F.linear(
+            h, self.contact_head.weight, self.contact_head.bias
+        ).squeeze(-1)
+        pair_contact_bias = self.contact_pair_bias_ln(self.contact_pair_bias_proj(h))
+        head_contact_bias = self.contact_head_bias_ln(
+            self.contact_head_bias_proj(head_queries)
+        )
+        # Each head now scores a pair-specific bias map instead of applying one
+        # global scalar offset to every protein-RNA position.
+        head_contact_shift = self._compute_pair_local_head_contact_bias(
+            pair_contact_bias=pair_contact_bias,
+            head_contact_bias=head_contact_bias,
+        )
+        logits = base_contact_logits.unsqueeze(0) + head_contact_shift
+        proposal_state = {
+            "h": h,
+            "head_queries": head_queries,
+            "delta_feature_scale": delta_feature_scale,
+            "base_contact_logits": base_contact_logits,
+            "pair_contact_bias": pair_contact_bias,
+            "head_contact_bias": head_contact_bias,
+            "pair_delta_pr_bias": self.delta_pair_pr_ln(self.delta_pair_pr_proj(h)),
+            "pair_delta_rp_bias": self.delta_pair_rp_ln(self.delta_pair_rp_proj(h)),
+        }
+        return logits, proposal_state
+
+    def _ensure_base_delta(
+        self, proposal_state: dict[str, torch.Tensor]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        base_delta_pr = proposal_state.get("base_delta_pr")
+        base_delta_rp = proposal_state.get("base_delta_rp")
+        if base_delta_pr is None or base_delta_rp is None:
+            h = proposal_state["h"]
+            base_delta_pr = F.linear(
+                h, self.delta_head_pr.weight, self.delta_head_pr.bias
             )
-            deltas_rp.append(
-                delta_gate * self.delta_scale * delta_feature_scale * delta_rp_unit
+            base_delta_rp = F.linear(
+                h, self.delta_head_rp.weight, self.delta_head_rp.bias
             )
-            logits.append(contact_logits)
+            proposal_state["base_delta_pr"] = base_delta_pr
+            proposal_state["base_delta_rp"] = base_delta_rp
+        return base_delta_pr, base_delta_rp
+
+    def decode_selected_heads(
+        self,
+        proposal_state: dict[str, torch.Tensor],
+        head_indices: int | list[int] | torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Lazily decode deltas only for the selected heads.
+
+        Args:
+            proposal_state: state returned by ``forward``.
+            head_indices: scalar head id or a list/tensor of head ids.
+
+        Returns:
+            delta_pr: [K_sel, N_protein_token, N_rna_token, c_z]
+            delta_rp: [K_sel, N_protein_token, N_rna_token, c_z]
+        """
+        if not torch.is_tensor(head_indices):
+            head_indices = torch.as_tensor(
+                head_indices, device=proposal_state["head_queries"].device
+            )
+        head_indices = head_indices.long().reshape(-1)
+
+        base_delta_pr, base_delta_rp = self._ensure_base_delta(proposal_state)
+        head_queries = proposal_state["head_queries"].index_select(0, head_indices)
+        head_delta_pr_bias = self.delta_head_pr_ln(
+            self.delta_head_pr_proj(head_queries)
+        )
+        head_delta_rp_bias = self.delta_head_rp_ln(
+            self.delta_head_rp_proj(head_queries)
+        )
+        selected_logits = (
+            proposal_state["base_contact_logits"].unsqueeze(0)
+            + self._compute_pair_local_head_contact_bias(
+                pair_contact_bias=proposal_state["pair_contact_bias"],
+                head_contact_bias=proposal_state["head_contact_bias"].index_select(
+                    0, head_indices
+                ),
+            )
+        )
+        delta_gate = (
+            self.gate_floor + (1.0 - self.gate_floor) * torch.sigmoid(selected_logits)
+        ).unsqueeze(-1)
+
+        delta_pr_shift = self._compute_pair_local_delta_shift(
+            pair_delta_bias=proposal_state["pair_delta_pr_bias"],
+            head_delta_bias=head_delta_pr_bias,
+        )
+        delta_rp_shift = self._compute_pair_local_delta_shift(
+            pair_delta_bias=proposal_state["pair_delta_rp_bias"],
+            head_delta_bias=head_delta_rp_bias,
+        )
+        delta_pr_raw = base_delta_pr.unsqueeze(0) + delta_pr_shift
+        delta_rp_raw = base_delta_rp.unsqueeze(0) + delta_rp_shift
+        delta_pr_unit = F.normalize(delta_pr_raw, p=2, dim=-1, eps=1e-6)
+        delta_rp_unit = F.normalize(delta_rp_raw, p=2, dim=-1, eps=1e-6)
+        delta_scale = self.delta_scale * proposal_state["delta_feature_scale"].unsqueeze(0)
         return (
-            torch.stack(logits, dim=0),
-            torch.stack(deltas_pr, dim=0),
-            torch.stack(deltas_rp, dim=0),
+            delta_gate * delta_scale * delta_pr_unit,
+            delta_gate * delta_scale * delta_rp_unit,
         )
