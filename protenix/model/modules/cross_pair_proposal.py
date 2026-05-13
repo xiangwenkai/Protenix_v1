@@ -19,6 +19,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from protenix.data.constants import (
+    DNA_STD_RESIDUES,
+    PRO_STD_RESIDUES,
+    RNA_STD_RESIDUES,
+    STD_RESIDUES_WITH_GAP,
+)
+
 
 def atom_mask_to_token_mask(
     atom_mask: torch.Tensor,
@@ -198,6 +205,146 @@ def build_regular_simplex_slots(
     return coords.to(device=device, dtype=dtype)
 
 
+_RESTYPE_DIM = len(STD_RESIDUES_WITH_GAP)
+_TOKEN_FEATURE_LAYOUT = {
+    "is_protein": _RESTYPE_DIM + 0,
+    "is_rna": _RESTYPE_DIM + 1,
+    "has_frame": _RESTYPE_DIM + 2,
+    "positive_charge": _RESTYPE_DIM + 3,
+    "negative_charge": _RESTYPE_DIM + 4,
+    "aromatic": _RESTYPE_DIM + 5,
+    "nucleic_base": _RESTYPE_DIM + 6,
+    "purine": _RESTYPE_DIM + 7,
+    "pyrimidine": _RESTYPE_DIM + 8,
+}
+_TOKEN_FEATURE_DIM = _RESTYPE_DIM + len(_TOKEN_FEATURE_LAYOUT)
+_BIO_PAIR_FEATURE_DIM = 6
+_GEOMETRY_PAIR_FEATURE_DIM = 4
+
+
+def build_cross_pair_token_feature_tensor(
+    restype: torch.Tensor,
+    has_frame: Optional[torch.Tensor] = None,
+    *,
+    is_protein: bool,
+    is_rna: bool,
+) -> torch.Tensor:
+    """
+    Build a compact token descriptor for cross-pair content/geometry heads.
+    """
+    if restype.shape[-1] != _RESTYPE_DIM:
+        raise ValueError(
+            f"Expected restype feature dim {_RESTYPE_DIM}, got {restype.shape[-1]}"
+        )
+
+    restype = restype.to(torch.float32)
+    token_feat = restype.new_zeros((restype.shape[0], _TOKEN_FEATURE_DIM))
+    token_feat[:, :_RESTYPE_DIM] = restype
+
+    if has_frame is not None:
+        token_feat[:, _TOKEN_FEATURE_LAYOUT["has_frame"]] = has_frame.to(
+            dtype=restype.dtype
+        ).reshape(-1)
+
+    if is_protein:
+        token_feat[:, _TOKEN_FEATURE_LAYOUT["is_protein"]] = 1.0
+    if is_rna:
+        token_feat[:, _TOKEN_FEATURE_LAYOUT["is_rna"]] = 1.0
+
+    positive = (
+        restype[:, PRO_STD_RESIDUES["ARG"]]
+        + restype[:, PRO_STD_RESIDUES["LYS"]]
+        + 0.5 * restype[:, PRO_STD_RESIDUES["HIS"]]
+    )
+    negative = restype[:, PRO_STD_RESIDUES["ASP"]] + restype[:, PRO_STD_RESIDUES["GLU"]]
+    aromatic = (
+        restype[:, PRO_STD_RESIDUES["PHE"]]
+        + restype[:, PRO_STD_RESIDUES["TRP"]]
+        + restype[:, PRO_STD_RESIDUES["TYR"]]
+        + 0.5 * restype[:, PRO_STD_RESIDUES["HIS"]]
+    )
+    nucleic_base = (
+        restype[:, RNA_STD_RESIDUES["A"]]
+        + restype[:, RNA_STD_RESIDUES["G"]]
+        + restype[:, RNA_STD_RESIDUES["C"]]
+        + restype[:, RNA_STD_RESIDUES["U"]]
+        + restype[:, DNA_STD_RESIDUES["DA"]]
+        + restype[:, DNA_STD_RESIDUES["DG"]]
+        + restype[:, DNA_STD_RESIDUES["DC"]]
+        + restype[:, DNA_STD_RESIDUES["DT"]]
+    )
+    purine = (
+        restype[:, RNA_STD_RESIDUES["A"]]
+        + restype[:, RNA_STD_RESIDUES["G"]]
+        + restype[:, DNA_STD_RESIDUES["DA"]]
+        + restype[:, DNA_STD_RESIDUES["DG"]]
+    )
+    pyrimidine = (
+        restype[:, RNA_STD_RESIDUES["C"]]
+        + restype[:, RNA_STD_RESIDUES["U"]]
+        + restype[:, DNA_STD_RESIDUES["DC"]]
+        + restype[:, DNA_STD_RESIDUES["DT"]]
+    )
+
+    token_feat[:, _TOKEN_FEATURE_LAYOUT["positive_charge"]] = positive
+    token_feat[:, _TOKEN_FEATURE_LAYOUT["negative_charge"]] = negative
+    token_feat[:, _TOKEN_FEATURE_LAYOUT["aromatic"]] = aromatic
+    token_feat[:, _TOKEN_FEATURE_LAYOUT["nucleic_base"]] = nucleic_base
+    token_feat[:, _TOKEN_FEATURE_LAYOUT["purine"]] = purine
+    token_feat[:, _TOKEN_FEATURE_LAYOUT["pyrimidine"]] = pyrimidine
+    return token_feat
+
+
+def build_cross_pair_pair_feature_tensors(
+    prot_token_feat: torch.Tensor,
+    rna_token_feat: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build lightweight pairwise biological and geometry proxy features."""
+    prot_positive = prot_token_feat[:, _TOKEN_FEATURE_LAYOUT["positive_charge"]]
+    prot_negative = prot_token_feat[:, _TOKEN_FEATURE_LAYOUT["negative_charge"]]
+    prot_aromatic = prot_token_feat[:, _TOKEN_FEATURE_LAYOUT["aromatic"]]
+    prot_has_frame = prot_token_feat[:, _TOKEN_FEATURE_LAYOUT["has_frame"]]
+
+    rna_base = rna_token_feat[:, _TOKEN_FEATURE_LAYOUT["nucleic_base"]]
+    rna_purine = rna_token_feat[:, _TOKEN_FEATURE_LAYOUT["purine"]]
+    rna_pyrimidine = rna_token_feat[:, _TOKEN_FEATURE_LAYOUT["pyrimidine"]]
+    rna_has_frame = rna_token_feat[:, _TOKEN_FEATURE_LAYOUT["has_frame"]]
+
+    prot_positive_pair = prot_positive[:, None].expand(-1, rna_token_feat.shape[0])
+    prot_negative_pair = prot_negative[:, None].expand(-1, rna_token_feat.shape[0])
+    prot_aromatic_pair = prot_aromatic[:, None].expand(-1, rna_token_feat.shape[0])
+    prot_frame_pair = prot_has_frame[:, None].expand(-1, rna_token_feat.shape[0])
+    rna_base_pair = rna_base[None, :].expand(prot_token_feat.shape[0], -1)
+    rna_purine_pair = rna_purine[None, :].expand(prot_token_feat.shape[0], -1)
+    rna_pyrimidine_pair = rna_pyrimidine[None, :].expand(
+        prot_token_feat.shape[0], -1
+    )
+    rna_frame_pair = rna_has_frame[None, :].expand(prot_token_feat.shape[0], -1)
+
+    frame_pair = prot_frame_pair * rna_frame_pair
+    bio_pair_feat = torch.stack(
+        [
+            prot_positive_pair * rna_base_pair,
+            prot_negative_pair * rna_base_pair,
+            prot_aromatic_pair * rna_base_pair,
+            prot_aromatic_pair * rna_purine_pair,
+            prot_aromatic_pair * rna_pyrimidine_pair,
+            frame_pair,
+        ],
+        dim=-1,
+    )
+    geometry_pair_feat = torch.stack(
+        [
+            prot_frame_pair,
+            rna_frame_pair,
+            frame_pair,
+            torch.abs(prot_frame_pair - rna_frame_pair),
+        ],
+        dim=-1,
+    )
+    return bio_pair_feat, geometry_pair_feat
+
+
 class KWayCrossPairProposal(nn.Module):
     """
     Generate K alternative protein-RNA cross-pair proposals from the trunk pair
@@ -214,6 +361,19 @@ class KWayCrossPairProposal(nn.Module):
         delta_scale: float = 1.0,
         head_slot_init: str = "random",
         head_slot_init_scale: float = 1.0,
+        token_feature_dim: int = _TOKEN_FEATURE_DIM,
+        bio_pair_feature_dim: int = _BIO_PAIR_FEATURE_DIM,
+        geometry_pair_feature_dim: int = _GEOMETRY_PAIR_FEATURE_DIM,
+        token_hidden_dim: Optional[int] = None,
+        use_content_branch: bool = True,
+        use_geometry_branch: bool = True,
+        use_pair_bio_feat: bool = True,
+        use_pair_geom_feat: bool = True,
+        content_logit_scale: float = 1.0,
+        geometry_logit_scale: float = 0.1,
+        bio_pair_feat_scale: float = 1.0,
+        geom_pair_feat_scale: float = 1.0,
+        freeze_geometry_for_head0: bool = False,
         gate_floor: float = 0.0,
         random_branch_diffusion_batch_size: int = 8,
         contact_threshold: float = 8.0,
@@ -227,6 +387,21 @@ class KWayCrossPairProposal(nn.Module):
         self.delta_scale = delta_scale
         self.head_slot_init = head_slot_init
         self.head_slot_init_scale = head_slot_init_scale
+        self.token_feature_dim = token_feature_dim
+        self.bio_pair_feature_dim = bio_pair_feature_dim
+        self.geometry_pair_feature_dim = geometry_pair_feature_dim
+        self.token_hidden_dim = (
+            max(hidden_dim // 2, 32) if token_hidden_dim is None else token_hidden_dim
+        )
+        self.use_content_branch = use_content_branch
+        self.use_geometry_branch = use_geometry_branch
+        self.use_pair_bio_feat = use_pair_bio_feat
+        self.use_pair_geom_feat = use_pair_geom_feat
+        self.content_logit_scale = content_logit_scale
+        self.geometry_logit_scale = geometry_logit_scale
+        self.bio_pair_feat_scale = bio_pair_feat_scale
+        self.geom_pair_feat_scale = geom_pair_feat_scale
+        self.freeze_geometry_for_head0 = freeze_geometry_for_head0
         self.gate_floor = gate_floor
         self.random_branch_diffusion_batch_size = random_branch_diffusion_batch_size
         self.contact_threshold = contact_threshold
@@ -275,12 +450,36 @@ class KWayCrossPairProposal(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
         )
         self.contact_head = nn.Linear(hidden_dim, 1)
-        # Pair-local head bias: each head now produces a position-dependent bias
-        # map instead of a single scalar offset for the whole contact matrix.
-        self.contact_pair_bias_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
-        self.contact_pair_bias_ln = nn.LayerNorm(hidden_dim)
-        self.contact_head_bias_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
-        self.contact_head_bias_ln = nn.LayerNorm(hidden_dim)
+        self.prot_content_tower = nn.Sequential(
+            nn.Linear(token_feature_dim, self.token_hidden_dim),
+            nn.GELU(),
+            nn.Linear(self.token_hidden_dim, self.token_hidden_dim),
+        )
+        self.rna_content_tower = nn.Sequential(
+            nn.Linear(token_feature_dim, self.token_hidden_dim),
+            nn.GELU(),
+            nn.Linear(self.token_hidden_dim, self.token_hidden_dim),
+        )
+        content_input_dim = (
+            hidden_dim + 4 * self.token_hidden_dim + bio_pair_feature_dim
+        )
+        self.content_pair_ln = nn.LayerNorm(content_input_dim)
+        self.content_pair_mlp = nn.Sequential(
+            nn.Linear(content_input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.content_out_ln = nn.LayerNorm(hidden_dim)
+        self.content_head_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.content_head_ln = nn.LayerNorm(hidden_dim)
+        self.geometry_seed_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.geometry_seed_ln = nn.LayerNorm(hidden_dim)
+        self.geometry_pair_proj = nn.Linear(geometry_pair_feature_dim, hidden_dim)
+        self.geometry_pair_ln = nn.LayerNorm(hidden_dim)
+        self.geometry_gate = nn.Linear(2 * hidden_dim, hidden_dim)
+        self.geometry_out_ln = nn.LayerNorm(hidden_dim)
+        self.geometry_head_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.geometry_head_ln = nn.LayerNorm(hidden_dim)
         self.delta_pair_pr_proj = nn.Linear(hidden_dim, c_z, bias=False)
         self.delta_pair_pr_ln = nn.LayerNorm(c_z)
         self.delta_head_pr_proj = nn.Linear(hidden_dim, c_z, bias=False)
@@ -329,14 +528,14 @@ class KWayCrossPairProposal(nn.Module):
 
             self.head_slots.copy_(scale * slots.to(dtype=self.head_slots.dtype))
 
-    def _compute_pair_local_head_contact_bias(
+    def _compute_pair_local_head_shift(
         self,
-        pair_contact_bias: torch.Tensor,
-        head_contact_bias: torch.Tensor,
+        pair_feature: torch.Tensor,
+        head_feature: torch.Tensor,
     ) -> torch.Tensor:
-        return torch.einsum(
-            "prc,kc->kpr", pair_contact_bias, head_contact_bias
-        ) / math.sqrt(self.hidden_dim)
+        return torch.einsum("prc,kc->kpr", pair_feature, head_feature) / math.sqrt(
+            self.hidden_dim
+        )
 
     def _compute_pair_local_delta_shift(
         self,
@@ -345,8 +544,94 @@ class KWayCrossPairProposal(nn.Module):
     ) -> torch.Tensor:
         return pair_delta_bias.unsqueeze(0) * head_delta_bias[:, None, None, :]
 
+    def _build_content_pair_feature(
+        self,
+        h: torch.Tensor,
+        prot_token_feat: Optional[torch.Tensor],
+        rna_token_feat: Optional[torch.Tensor],
+        bio_pair_feat: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        n_prot, n_rna, _ = h.shape
+        if not self.use_content_branch:
+            return h.new_zeros(h.shape)
+        if prot_token_feat is None:
+            prot_token_feat = h.new_zeros((n_prot, self.token_feature_dim))
+        if rna_token_feat is None:
+            rna_token_feat = h.new_zeros((n_rna, self.token_feature_dim))
+        if bio_pair_feat is None:
+            bio_pair_feat = h.new_zeros((n_prot, n_rna, self.bio_pair_feature_dim))
+        elif not self.use_pair_bio_feat:
+            bio_pair_feat = h.new_zeros((n_prot, n_rna, self.bio_pair_feature_dim))
+
+        prot_ctx = self.prot_content_tower(prot_token_feat.to(dtype=h.dtype))
+        rna_ctx = self.rna_content_tower(rna_token_feat.to(dtype=h.dtype))
+        prot_ctx_pair = prot_ctx[:, None, :].expand(-1, n_rna, -1)
+        rna_ctx_pair = rna_ctx[None, :, :].expand(n_prot, -1, -1)
+        pair_input = torch.cat(
+            [
+                h,
+                prot_ctx_pair,
+                rna_ctx_pair,
+                prot_ctx_pair * rna_ctx_pair,
+                torch.abs(prot_ctx_pair - rna_ctx_pair),
+                self.bio_pair_feat_scale * bio_pair_feat.to(dtype=h.dtype),
+            ],
+            dim=-1,
+        )
+        return self.content_out_ln(
+            h + self.content_pair_mlp(self.content_pair_ln(pair_input))
+        )
+
+    def _build_geometry_pair_feature(
+        self,
+        h: torch.Tensor,
+        geom_pair_feat: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        n_prot, n_rna, _ = h.shape
+        if not self.use_geometry_branch:
+            return h.new_zeros(h.shape)
+        if geom_pair_feat is None:
+            geom_pair_feat = h.new_zeros(
+                (n_prot, n_rna, self.geometry_pair_feature_dim)
+            )
+        elif not self.use_pair_geom_feat:
+            geom_pair_feat = h.new_zeros(
+                (n_prot, n_rna, self.geometry_pair_feature_dim)
+            )
+        geom_seed = self.geometry_seed_ln(self.geometry_seed_proj(h))
+        geom_aux = self.geometry_pair_ln(
+            self.geometry_pair_proj(
+                self.geom_pair_feat_scale * geom_pair_feat.to(dtype=h.dtype)
+            )
+        )
+        geom_gate = torch.sigmoid(
+            self.geometry_gate(torch.cat([geom_seed, geom_aux], dim=-1))
+        )
+        return self.geometry_out_ln(geom_seed + geom_gate * geom_aux)
+
+    def _compute_contact_logits(
+        self,
+        base_contact_logits: torch.Tensor,
+        pair_content: torch.Tensor,
+        head_content: torch.Tensor,
+        pair_geometry: torch.Tensor,
+        head_geometry: torch.Tensor,
+    ) -> torch.Tensor:
+        content_shift = self._compute_pair_local_head_shift(pair_content, head_content)
+        geometry_shift = self._compute_pair_local_head_shift(pair_geometry, head_geometry)
+        return (
+            base_contact_logits.unsqueeze(0)
+            + self.content_logit_scale * content_shift
+            + self.geometry_logit_scale * geometry_shift
+        )
+
     def forward(
-        self, z_pr: torch.Tensor
+        self,
+        z_pr: torch.Tensor,
+        prot_token_feat: Optional[torch.Tensor] = None,
+        rna_token_feat: Optional[torch.Tensor] = None,
+        bio_pair_feat: Optional[torch.Tensor] = None,
+        geom_pair_feat: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """
         Args:
@@ -384,28 +669,42 @@ class KWayCrossPairProposal(nn.Module):
         )
         slots = slot_input + slot_attn_out
         slots = slots + self.slot_mlp(self.slot_post_ln(slots))
-        head_queries = slots.squeeze(0)
+        head_state = slots.squeeze(0)
         base_contact_logits = F.linear(
             h, self.contact_head.weight, self.contact_head.bias
         ).squeeze(-1)
-        pair_contact_bias = self.contact_pair_bias_ln(self.contact_pair_bias_proj(h))
-        head_contact_bias = self.contact_head_bias_ln(
-            self.contact_head_bias_proj(head_queries)
+        pair_content = self._build_content_pair_feature(
+            h=h,
+            prot_token_feat=prot_token_feat,
+            rna_token_feat=rna_token_feat,
+            bio_pair_feat=bio_pair_feat,
         )
-        # Each head now scores a pair-specific bias map instead of applying one
-        # global scalar offset to every protein-RNA position.
-        head_contact_shift = self._compute_pair_local_head_contact_bias(
-            pair_contact_bias=pair_contact_bias,
-            head_contact_bias=head_contact_bias,
+        pair_geometry = self._build_geometry_pair_feature(
+            h=h,
+            geom_pair_feat=geom_pair_feat,
         )
-        logits = base_contact_logits.unsqueeze(0) + head_contact_shift
+        head_content = self.content_head_ln(self.content_head_proj(head_state))
+        head_geometry = self.geometry_head_ln(self.geometry_head_proj(head_state))
+        if self.freeze_geometry_for_head0 and head_geometry.shape[0] > 0:
+            head_geometry = head_geometry.clone()
+            head_geometry[0] = 0.0
+        logits = self._compute_contact_logits(
+            base_contact_logits=base_contact_logits,
+            pair_content=pair_content,
+            head_content=head_content,
+            pair_geometry=pair_geometry,
+            head_geometry=head_geometry,
+        )
         proposal_state = {
             "h": h,
-            "head_queries": head_queries,
+            "head_state": head_state,
+            "head_queries": head_state,
+            "head_content": head_content,
+            "head_geometry": head_geometry,
             "delta_feature_scale": delta_feature_scale,
             "base_contact_logits": base_contact_logits,
-            "pair_contact_bias": pair_contact_bias,
-            "head_contact_bias": head_contact_bias,
+            "pair_content": pair_content,
+            "pair_geometry": pair_geometry,
             "pair_delta_pr_bias": self.delta_pair_pr_ln(self.delta_pair_pr_proj(h)),
             "pair_delta_rp_bias": self.delta_pair_rp_ln(self.delta_pair_rp_proj(h)),
         }
@@ -451,21 +750,21 @@ class KWayCrossPairProposal(nn.Module):
         head_indices = head_indices.long().reshape(-1)
 
         base_delta_pr, base_delta_rp = self._ensure_base_delta(proposal_state)
-        head_queries = proposal_state["head_queries"].index_select(0, head_indices)
+        head_queries = proposal_state["head_state"].index_select(0, head_indices)
         head_delta_pr_bias = self.delta_head_pr_ln(
             self.delta_head_pr_proj(head_queries)
         )
         head_delta_rp_bias = self.delta_head_rp_ln(
             self.delta_head_rp_proj(head_queries)
         )
-        selected_logits = (
-            proposal_state["base_contact_logits"].unsqueeze(0)
-            + self._compute_pair_local_head_contact_bias(
-                pair_contact_bias=proposal_state["pair_contact_bias"],
-                head_contact_bias=proposal_state["head_contact_bias"].index_select(
-                    0, head_indices
-                ),
-            )
+        selected_logits = self._compute_contact_logits(
+            base_contact_logits=proposal_state["base_contact_logits"],
+            pair_content=proposal_state["pair_content"],
+            head_content=proposal_state["head_content"].index_select(0, head_indices),
+            pair_geometry=proposal_state["pair_geometry"],
+            head_geometry=proposal_state["head_geometry"].index_select(
+                0, head_indices
+            ),
         )
         delta_gate = (
             self.gate_floor + (1.0 - self.gate_floor) * torch.sigmoid(selected_logits)

@@ -32,6 +32,8 @@ from protenix.model.generator import (
 from protenix.model.modules.confidence import ConfidenceHead
 from protenix.model.modules.cross_pair_proposal import (
     atom_mask_to_token_mask,
+    build_cross_pair_pair_feature_tensors,
+    build_cross_pair_token_feature_tensor,
     build_cross_pair_target_contact_map,
     compute_per_head_contact_losses,
     KWayCrossPairProposal,
@@ -440,7 +442,36 @@ class Protenix(nn.Module):
         if prot_idx.numel() == 0 or rna_idx.numel() == 0:
             return None
         z_pr = z[prot_idx[:, None], rna_idx[None, :], :]
-        logits, proposal_state = self.cross_pair_proposal(z_pr)
+        has_frame = input_feature_dict.get("has_frame")
+        prot_has_frame = (
+            has_frame.index_select(0, prot_idx) if has_frame is not None else None
+        )
+        rna_has_frame = (
+            has_frame.index_select(0, rna_idx) if has_frame is not None else None
+        )
+        prot_token_feat = build_cross_pair_token_feature_tensor(
+            restype=input_feature_dict["restype"].index_select(0, prot_idx),
+            has_frame=prot_has_frame,
+            is_protein=True,
+            is_rna=False,
+        )
+        rna_token_feat = build_cross_pair_token_feature_tensor(
+            restype=input_feature_dict["restype"].index_select(0, rna_idx),
+            has_frame=rna_has_frame,
+            is_protein=False,
+            is_rna=True,
+        )
+        bio_pair_feat, geom_pair_feat = build_cross_pair_pair_feature_tensors(
+            prot_token_feat=prot_token_feat,
+            rna_token_feat=rna_token_feat,
+        )
+        logits, proposal_state = self.cross_pair_proposal(
+            z_pr,
+            prot_token_feat=prot_token_feat,
+            rna_token_feat=rna_token_feat,
+            bio_pair_feat=bio_pair_feat,
+            geom_pair_feat=geom_pair_feat,
+        )
         probs = torch.sigmoid(logits)
         return {
             "logits": logits,
