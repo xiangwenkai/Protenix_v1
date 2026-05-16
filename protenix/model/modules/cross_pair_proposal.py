@@ -370,9 +370,13 @@ class KWayCrossPairProposal(nn.Module):
         use_pair_bio_feat: bool = True,
         use_pair_geom_feat: bool = True,
         content_logit_scale: float = 1.0,
-        geometry_logit_scale: float = 0.1,
         bio_pair_feat_scale: float = 1.0,
         geom_pair_feat_scale: float = 1.0,
+        num_content_slot_bank: int = 4,
+        content_prior_hidden_dim: Optional[int] = None,
+        content_prior_bias_scale: float = 1.0,
+        content_delta_scale: float = 1.0,
+        geometry_delta_scale: float = 1.0,
         freeze_geometry_for_head0: bool = False,
         gate_floor: float = 0.0,
         random_branch_diffusion_batch_size: int = 8,
@@ -393,14 +397,22 @@ class KWayCrossPairProposal(nn.Module):
         self.token_hidden_dim = (
             max(hidden_dim // 2, 32) if token_hidden_dim is None else token_hidden_dim
         )
+        self.num_content_slot_bank = num_content_slot_bank
+        self.content_prior_hidden_dim = (
+            hidden_dim
+            if content_prior_hidden_dim is None
+            else content_prior_hidden_dim
+        )
         self.use_content_branch = use_content_branch
         self.use_geometry_branch = use_geometry_branch
         self.use_pair_bio_feat = use_pair_bio_feat
         self.use_pair_geom_feat = use_pair_geom_feat
         self.content_logit_scale = content_logit_scale
-        self.geometry_logit_scale = geometry_logit_scale
         self.bio_pair_feat_scale = bio_pair_feat_scale
         self.geom_pair_feat_scale = geom_pair_feat_scale
+        self.content_prior_bias_scale = content_prior_bias_scale
+        self.content_delta_scale = content_delta_scale
+        self.geometry_delta_scale = geometry_delta_scale
         self.freeze_geometry_for_head0 = freeze_geometry_for_head0
         self.gate_floor = gate_floor
         self.random_branch_diffusion_batch_size = random_branch_diffusion_batch_size
@@ -430,6 +442,20 @@ class KWayCrossPairProposal(nn.Module):
         # learned base slots + an input-dependent query initializer, followed by
         # cross-attention over the cross-pair context map.
         self.head_slots = nn.Parameter(torch.empty(num_heads, hidden_dim))
+        self.head_content_mix = nn.Parameter(
+            torch.empty(num_heads, num_content_slot_bank)
+        )
+        self.content_prior_input_ln = nn.LayerNorm(hidden_dim + 1)
+        self.content_prior_bank = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(hidden_dim + 1, self.content_prior_hidden_dim),
+                    nn.GELU(),
+                    nn.Linear(self.content_prior_hidden_dim, 1),
+                )
+                for _ in range(num_content_slot_bank)
+            ]
+        )
         self.query_ln = nn.LayerNorm(hidden_dim)
         self.query_mlp = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
@@ -480,6 +506,22 @@ class KWayCrossPairProposal(nn.Module):
         self.geometry_out_ln = nn.LayerNorm(hidden_dim)
         self.geometry_head_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
         self.geometry_head_ln = nn.LayerNorm(hidden_dim)
+        self.content_delta_pair_pr_proj = nn.Linear(hidden_dim, c_z, bias=False)
+        self.content_delta_pair_pr_ln = nn.LayerNorm(c_z)
+        self.content_delta_head_pr_proj = nn.Linear(hidden_dim, c_z, bias=False)
+        self.content_delta_head_pr_ln = nn.LayerNorm(c_z)
+        self.content_delta_pair_rp_proj = nn.Linear(hidden_dim, c_z, bias=False)
+        self.content_delta_pair_rp_ln = nn.LayerNorm(c_z)
+        self.content_delta_head_rp_proj = nn.Linear(hidden_dim, c_z, bias=False)
+        self.content_delta_head_rp_ln = nn.LayerNorm(c_z)
+        self.geometry_delta_pair_pr_proj = nn.Linear(hidden_dim, c_z, bias=False)
+        self.geometry_delta_pair_pr_ln = nn.LayerNorm(c_z)
+        self.geometry_delta_head_pr_proj = nn.Linear(hidden_dim, c_z, bias=False)
+        self.geometry_delta_head_pr_ln = nn.LayerNorm(c_z)
+        self.geometry_delta_pair_rp_proj = nn.Linear(hidden_dim, c_z, bias=False)
+        self.geometry_delta_pair_rp_ln = nn.LayerNorm(c_z)
+        self.geometry_delta_head_rp_proj = nn.Linear(hidden_dim, c_z, bias=False)
+        self.geometry_delta_head_rp_ln = nn.LayerNorm(c_z)
         self.delta_pair_pr_proj = nn.Linear(hidden_dim, c_z, bias=False)
         self.delta_pair_pr_ln = nn.LayerNorm(c_z)
         self.delta_head_pr_proj = nn.Linear(hidden_dim, c_z, bias=False)
@@ -492,41 +534,63 @@ class KWayCrossPairProposal(nn.Module):
         self.delta_head_rp = nn.Linear(hidden_dim, c_z)
         self._reset_head_slots()
 
-    def _reset_head_slots(self) -> None:
+    def _build_slot_vectors(
+        self,
+        num_vectors: int,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
         mode = self.head_slot_init.lower()
         scale = float(self.head_slot_init_scale)
-        with torch.no_grad():
-            if mode == "random":
-                nn.init.normal_(self.head_slots, mean=0.0, std=scale)
-                return
+        if num_vectors <= 0:
+            raise ValueError("slot bank sizes must be positive")
+        if mode == "random":
+            slots = torch.randn(num_vectors, self.hidden_dim, device=device, dtype=dtype)
+            return scale * slots
 
-            if mode == "orthogonal":
-                if self.num_heads > self.hidden_dim:
-                    raise ValueError(
-                        "orthogonal head slot init requires num_heads <= hidden_dim"
-                    )
-                basis = torch.randn(
-                    self.hidden_dim,
+        if mode == "orthogonal":
+            if num_vectors > self.hidden_dim:
+                raise ValueError(
+                    "orthogonal head slot init requires slot bank size <= hidden_dim"
+                )
+            basis = torch.randn(
+                self.hidden_dim,
+                num_vectors,
+                device=device,
+                dtype=torch.float32,
+            )
+            slots, _ = torch.linalg.qr(basis, mode="reduced")
+            slots = slots.transpose(0, 1)
+        elif mode == "simplex":
+            slots = build_regular_simplex_slots(
+                num_heads=num_vectors,
+                hidden_dim=self.hidden_dim,
+                device=device,
+                dtype=torch.float32,
+            )
+        else:
+            raise ValueError(
+                f"Unsupported head_slot_init: {self.head_slot_init}. "
+                "Expected one of {'random', 'orthogonal', 'simplex'}."
+            )
+
+        return scale * slots.to(device=device, dtype=dtype)
+
+    def _reset_head_slots(self) -> None:
+        with torch.no_grad():
+            self.head_slots.copy_(
+                self._build_slot_vectors(
                     self.num_heads,
                     device=self.head_slots.device,
-                    dtype=torch.float32,
+                    dtype=self.head_slots.dtype,
                 )
-                slots, _ = torch.linalg.qr(basis, mode="reduced")
-                slots = slots.transpose(0, 1)
-            elif mode == "simplex":
-                slots = build_regular_simplex_slots(
-                    num_heads=self.num_heads,
-                    hidden_dim=self.hidden_dim,
-                    device=self.head_slots.device,
-                    dtype=torch.float32,
-                )
-            else:
-                raise ValueError(
-                    f"Unsupported head_slot_init: {self.head_slot_init}. "
-                    "Expected one of {'random', 'orthogonal', 'simplex'}."
-                )
-
-            self.head_slots.copy_(scale * slots.to(dtype=self.head_slots.dtype))
+            )
+            self.head_content_mix.fill_(-2.0)
+            content_assign = torch.arange(
+                self.num_heads, device=self.head_content_mix.device
+            ) % self.num_content_slot_bank
+            self.head_content_mix.scatter_(1, content_assign[:, None], 2.0)
 
     def _compute_pair_local_head_shift(
         self,
@@ -543,6 +607,20 @@ class KWayCrossPairProposal(nn.Module):
         head_delta_bias: torch.Tensor,
     ) -> torch.Tensor:
         return pair_delta_bias.unsqueeze(0) * head_delta_bias[:, None, None, :]
+
+    def _compute_content_prior_bias_bank(
+        self,
+        pair_content: torch.Tensor,
+        base_contact_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        prior_input = torch.cat(
+            [pair_content, base_contact_logits.unsqueeze(-1)], dim=-1
+        )
+        prior_input = self.content_prior_input_ln(prior_input)
+        prior_bias_bank = []
+        for prior_net in self.content_prior_bank:
+            prior_bias_bank.append(prior_net(prior_input).squeeze(-1))
+        return torch.stack(prior_bias_bank, dim=0)
 
     def _build_content_pair_feature(
         self,
@@ -612,17 +690,12 @@ class KWayCrossPairProposal(nn.Module):
     def _compute_contact_logits(
         self,
         base_contact_logits: torch.Tensor,
-        pair_content: torch.Tensor,
-        head_content: torch.Tensor,
-        pair_geometry: torch.Tensor,
-        head_geometry: torch.Tensor,
+        content_prior_shift: torch.Tensor,
     ) -> torch.Tensor:
-        content_shift = self._compute_pair_local_head_shift(pair_content, head_content)
-        geometry_shift = self._compute_pair_local_head_shift(pair_geometry, head_geometry)
         return (
             base_contact_logits.unsqueeze(0)
-            + self.content_logit_scale * content_shift
-            + self.geometry_logit_scale * geometry_shift
+            + self.content_logit_scale
+            * (self.content_prior_bias_scale * content_prior_shift)
         )
 
     def forward(
@@ -657,6 +730,7 @@ class KWayCrossPairProposal(nn.Module):
         dynamic_queries = self.query_mlp(self.query_ln(pooled)).view(
             self.num_heads, self.hidden_dim
         )
+        head_content_mix = F.softmax(self.head_content_mix, dim=-1)
         slot_init = self.head_slots + dynamic_queries
 
         kv = h.reshape(1, -1, self.hidden_dim)
@@ -683,6 +757,13 @@ class KWayCrossPairProposal(nn.Module):
             h=h,
             geom_pair_feat=geom_pair_feat,
         )
+        content_prior_bias_bank = self._compute_content_prior_bias_bank(
+            pair_content=pair_content,
+            base_contact_logits=base_contact_logits,
+        )
+        content_prior_shift = torch.einsum(
+            "kb,bpr->kpr", head_content_mix, content_prior_bias_bank
+        )
         head_content = self.content_head_ln(self.content_head_proj(head_state))
         head_geometry = self.geometry_head_ln(self.geometry_head_proj(head_state))
         if self.freeze_geometry_for_head0 and head_geometry.shape[0] > 0:
@@ -690,21 +771,33 @@ class KWayCrossPairProposal(nn.Module):
             head_geometry[0] = 0.0
         logits = self._compute_contact_logits(
             base_contact_logits=base_contact_logits,
-            pair_content=pair_content,
-            head_content=head_content,
-            pair_geometry=pair_geometry,
-            head_geometry=head_geometry,
+            content_prior_shift=content_prior_shift,
         )
         proposal_state = {
             "h": h,
             "head_state": head_state,
             "head_queries": head_state,
+            "head_content_mix": head_content_mix,
+            "content_prior_bias_bank": content_prior_bias_bank,
+            "content_prior_shift": content_prior_shift,
             "head_content": head_content,
             "head_geometry": head_geometry,
             "delta_feature_scale": delta_feature_scale,
             "base_contact_logits": base_contact_logits,
             "pair_content": pair_content,
             "pair_geometry": pair_geometry,
+            "content_pair_delta_pr_bias": self.content_delta_pair_pr_ln(
+                self.content_delta_pair_pr_proj(pair_content)
+            ),
+            "content_pair_delta_rp_bias": self.content_delta_pair_rp_ln(
+                self.content_delta_pair_rp_proj(pair_content)
+            ),
+            "geometry_pair_delta_pr_bias": self.geometry_delta_pair_pr_ln(
+                self.geometry_delta_pair_pr_proj(pair_geometry)
+            ),
+            "geometry_pair_delta_rp_bias": self.geometry_delta_pair_rp_ln(
+                self.geometry_delta_pair_rp_proj(pair_geometry)
+            ),
             "pair_delta_pr_bias": self.delta_pair_pr_ln(self.delta_pair_pr_proj(h)),
             "pair_delta_rp_bias": self.delta_pair_rp_ln(self.delta_pair_rp_proj(h)),
         }
@@ -751,18 +844,29 @@ class KWayCrossPairProposal(nn.Module):
 
         base_delta_pr, base_delta_rp = self._ensure_base_delta(proposal_state)
         head_queries = proposal_state["head_state"].index_select(0, head_indices)
+        head_content = proposal_state["head_content"].index_select(0, head_indices)
+        head_geometry = proposal_state["head_geometry"].index_select(0, head_indices)
         head_delta_pr_bias = self.delta_head_pr_ln(
             self.delta_head_pr_proj(head_queries)
         )
         head_delta_rp_bias = self.delta_head_rp_ln(
             self.delta_head_rp_proj(head_queries)
         )
+        content_head_delta_pr_bias = self.content_delta_head_pr_ln(
+            self.content_delta_head_pr_proj(head_content)
+        )
+        content_head_delta_rp_bias = self.content_delta_head_rp_ln(
+            self.content_delta_head_rp_proj(head_content)
+        )
+        geometry_head_delta_pr_bias = self.geometry_delta_head_pr_ln(
+            self.geometry_delta_head_pr_proj(head_geometry)
+        )
+        geometry_head_delta_rp_bias = self.geometry_delta_head_rp_ln(
+            self.geometry_delta_head_rp_proj(head_geometry)
+        )
         selected_logits = self._compute_contact_logits(
             base_contact_logits=proposal_state["base_contact_logits"],
-            pair_content=proposal_state["pair_content"],
-            head_content=proposal_state["head_content"].index_select(0, head_indices),
-            pair_geometry=proposal_state["pair_geometry"],
-            head_geometry=proposal_state["head_geometry"].index_select(
+            content_prior_shift=proposal_state["content_prior_shift"].index_select(
                 0, head_indices
             ),
         )
@@ -778,8 +882,34 @@ class KWayCrossPairProposal(nn.Module):
             pair_delta_bias=proposal_state["pair_delta_rp_bias"],
             head_delta_bias=head_delta_rp_bias,
         )
-        delta_pr_raw = base_delta_pr.unsqueeze(0) + delta_pr_shift
-        delta_rp_raw = base_delta_rp.unsqueeze(0) + delta_rp_shift
+        content_delta_pr_shift = self._compute_pair_local_delta_shift(
+            pair_delta_bias=proposal_state["content_pair_delta_pr_bias"],
+            head_delta_bias=content_head_delta_pr_bias,
+        )
+        content_delta_rp_shift = self._compute_pair_local_delta_shift(
+            pair_delta_bias=proposal_state["content_pair_delta_rp_bias"],
+            head_delta_bias=content_head_delta_rp_bias,
+        )
+        geometry_delta_pr_shift = self._compute_pair_local_delta_shift(
+            pair_delta_bias=proposal_state["geometry_pair_delta_pr_bias"],
+            head_delta_bias=geometry_head_delta_pr_bias,
+        )
+        geometry_delta_rp_shift = self._compute_pair_local_delta_shift(
+            pair_delta_bias=proposal_state["geometry_pair_delta_rp_bias"],
+            head_delta_bias=geometry_head_delta_rp_bias,
+        )
+        delta_pr_raw = (
+            base_delta_pr.unsqueeze(0)
+            + delta_pr_shift
+            + self.content_delta_scale * content_delta_pr_shift
+            + self.geometry_delta_scale * geometry_delta_pr_shift
+        )
+        delta_rp_raw = (
+            base_delta_rp.unsqueeze(0)
+            + delta_rp_shift
+            + self.content_delta_scale * content_delta_rp_shift
+            + self.geometry_delta_scale * geometry_delta_rp_shift
+        )
         delta_pr_unit = F.normalize(delta_pr_raw, p=2, dim=-1, eps=1e-6)
         delta_rp_unit = F.normalize(delta_rp_raw, p=2, dim=-1, eps=1e-6)
         delta_scale = self.delta_scale * proposal_state["delta_feature_scale"].unsqueeze(0)
