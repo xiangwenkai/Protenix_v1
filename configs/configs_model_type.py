@@ -45,7 +45,7 @@
 
 """
 model_configs = {
-    "protenix_base_cpp_v1.0.0": {
+    "protenix_base_cpp_040737": {
         "model": {
             "N_cycle": 10,
             "template_embedder": {
@@ -56,6 +56,108 @@ model_configs = {
             "N_step": 200,
         },  # the default inference setting for base model
     },
+    "protenix_base_cpp_040731": {
+      "model": {
+          "N_cycle": 10,
+          "template_embedder": {
+              "n_blocks": 2,
+          },
+          "cross_pair_proposal": {
+              "enable": True,
+              "num_heads": 20,
+              "delta_scale": 1.0,
+          },
+      },
+      "sample_diffusion": {
+          "N_step": 20,
+      },
+      "load_strict": True,
+  },
+    "protenix_base_cpp_040745": {
+      "model": {
+          "N_cycle": 10,
+          "template_embedder": {
+              "n_blocks": 2,
+          },
+          "cross_pair_proposal": {
+              "enable": True,
+              "num_heads": 20,
+              "delta_scale": 1.0,
+          },
+      },
+      "sample_diffusion": {
+          "N_step": 20,
+      },
+      "load_strict": True,
+  },
+    "protenix_base_cpp_040731_ema26999": {
+      "model": {
+          "N_cycle": 10,
+          "template_embedder": {
+              "n_blocks": 2,
+          },
+          "cross_pair_proposal": {
+              "enable": True,
+              "num_heads": 20,
+              "delta_scale": 1.0,
+          },
+      },
+      "sample_diffusion": {
+          "N_step": 20,
+      },
+      "load_strict": True,
+  },
+    "protenix_base_cpp_040737_ema26999": {
+      "model": {
+          "N_cycle": 10,
+          "template_embedder": {
+              "n_blocks": 2,
+          },
+          "cross_pair_proposal": {
+              "enable": True,
+              "num_heads": 20,
+              "delta_scale": 1.0,
+          },
+      },
+      "sample_diffusion": {
+          "N_step": 20,
+      },
+      "load_strict": True,
+  },
+    "protenix_base_cpp_084803_ema16999": {
+      "model": {
+          "N_cycle": 10,
+          "template_embedder": {
+              "n_blocks": 2,
+          },
+          "cross_pair_proposal": {
+              "enable": True,
+              "num_heads": 20,
+              "delta_scale": 1.0,
+          },
+      },
+      "sample_diffusion": {
+          "N_step": 20,
+      },
+      "load_strict": True,
+  },
+    "protenix_base_cpp_091708_ema23999": {
+      "model": {
+          "N_cycle": 10,
+          "template_embedder": {
+              "n_blocks": 2,
+          },
+          "cross_pair_proposal": {
+              "enable": True,
+              "num_heads": 20,
+              "delta_scale": 1.0,
+          },
+      },
+      "sample_diffusion": {
+          "N_step": 20,
+      },
+      "load_strict": True,
+  },
     "protenix_base_default_v1.0.0": {
         "model": {
             "N_cycle": 10,
