@@ -17,7 +17,12 @@ import os
 
 import pandas as pd
 import torch
-from esm import FastaBatchedDataset, pretrained
+try:
+    from esm.data import FastaBatchedDataset
+    from esm import pretrained
+except ImportError:
+    FastaBatchedDataset = None
+    pretrained = None
 from tqdm.auto import tqdm
 
 ESM_CONFIG = {
@@ -37,6 +42,8 @@ ESM_CONFIG = {
 
 
 def _load_esm2_model(model_path):
+    if pretrained is None:
+        raise RuntimeError("ESM2 (fair-esm) is not available. Cannot load ESM model.")
     if os.path.exists(model_path):
         model, alphabet = pretrained.load_model_and_alphabet_local(model_path)
     else:
@@ -106,6 +113,8 @@ def compute_esm2_embeddings(
     toks_per_batch=4096,
     truncation_seq_length=1022,
 ):
+    if FastaBatchedDataset is None:
+        raise RuntimeError("ESM2 (fair-esm) is not available. Cannot compute ESM embeddings.")
     dataset = FastaBatchedDataset(labels, sequences)
     batches = dataset.get_batch_indices(toks_per_batch, extra_toks_per_seq=1)
     data_loader = torch.utils.data.DataLoader(

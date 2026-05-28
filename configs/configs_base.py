@@ -427,7 +427,7 @@ loss_configs = {
             "dice_weight": 1.0,
             "pos_weight": 5.0,
             "diversity_margin": 0.5,
-            "diversity_weight": 0.2,
+            "diversity_weight": 0.4,
             "diversity_confidence_margin": 0.25,
             "diversity_ambiguity_weight": 1.0,
             "softmin_temperature": 0.1,

@@ -25,8 +25,6 @@ from protenix.data.constants import (
     RNA_STD_RESIDUES,
     STD_RESIDUES_WITH_GAP,
 )
-
-
 def atom_mask_to_token_mask(
     atom_mask: torch.Tensor,
     atom_to_token_idx: torch.Tensor,
@@ -63,49 +61,86 @@ def build_token_coordinate_tensor(
     return token_coord, token_valid
 
 
-def build_cross_pair_target_contact_map(
+def build_cross_pair_distance_target_map(
     feat_dict: dict,
     label_dict: dict,
     contact_threshold: float,
+    contact_temperature: float = 1.5,
 ) -> Optional[dict[str, torch.Tensor]]:
-    """Construct a protein-token x RNA-token target contact map."""
-    atom_to_token_idx = feat_dict["atom_to_token_idx"].long()
-    n_token = int(feat_dict["token_index"].shape[-1])
+    """Construct a soft token-pair target aligned to the full proposal grid."""
+    atom_to_token_idx = feat_dict['atom_to_token_idx'].long()
+    n_token = int(feat_dict['token_index'].shape[-1])
+
     prot_token_mask = atom_mask_to_token_mask(
-        feat_dict["is_protein"].bool(), atom_to_token_idx, n_token
+        feat_dict['is_protein'].bool(), atom_to_token_idx, n_token
     )
     rna_token_mask = atom_mask_to_token_mask(
-        feat_dict["is_rna"].bool(), atom_to_token_idx, n_token
+        feat_dict['is_rna'].bool(), atom_to_token_idx, n_token
     )
     prot_idx = torch.nonzero(prot_token_mask, as_tuple=False).squeeze(-1)
     rna_idx = torch.nonzero(rna_token_mask, as_tuple=False).squeeze(-1)
     if prot_idx.numel() == 0 or rna_idx.numel() == 0:
         return None
 
-    token_coord, token_valid = build_token_coordinate_tensor(
-        coordinate=label_dict["coordinate"],
-        coordinate_mask=label_dict["coordinate_mask"],
-        atom_to_token_idx=atom_to_token_idx,
-        rep_atom_mask=feat_dict["distogram_rep_atom_mask"],
-        n_token=n_token,
-    )
-    prot_valid = token_valid[prot_idx]
-    rna_valid = token_valid[rna_idx]
-    pair_valid = prot_valid[:, None] & rna_valid[None, :]
+    coord_mask = label_dict['coordinate_mask'].bool()
+    prot_atom_mask = feat_dict['is_protein'].bool() & coord_mask
+    rna_atom_mask = feat_dict['is_rna'].bool() & coord_mask
+    prot_atom_idx = torch.nonzero(prot_atom_mask, as_tuple=False).squeeze(-1)
+    rna_atom_idx = torch.nonzero(rna_atom_mask, as_tuple=False).squeeze(-1)
+
+    pair_shape = (prot_idx.shape[0], rna_idx.shape[0])
+    min_distance = label_dict['coordinate'].new_full(pair_shape, float('inf')).float()
+    pair_valid = torch.zeros(pair_shape, device=prot_idx.device, dtype=torch.bool)
+
+    if prot_atom_idx.numel() > 0 and rna_atom_idx.numel() > 0:
+        prot_atom_coord = label_dict['coordinate'].index_select(0, prot_atom_idx).float()
+        rna_atom_coord = label_dict['coordinate'].index_select(0, rna_atom_idx).float()
+        atom_pair_distance = torch.cdist(prot_atom_coord, rna_atom_coord)
+
+        prot_pair_token_idx = atom_to_token_idx.index_select(0, prot_atom_idx)
+        rna_pair_token_idx = atom_to_token_idx.index_select(0, rna_atom_idx)
+        n_rna = rna_idx.shape[0]
+        prot_token_to_local = torch.full((n_token,), -1, dtype=torch.long, device=prot_idx.device)
+        rna_token_to_local = torch.full((n_token,), -1, dtype=torch.long, device=rna_idx.device)
+        prot_token_to_local[prot_idx] = torch.arange(prot_idx.shape[0], device=prot_idx.device)
+        rna_token_to_local[rna_idx] = torch.arange(rna_idx.shape[0], device=rna_idx.device)
+
+        local_prot_token = prot_token_to_local[prot_pair_token_idx]
+        local_rna_token = rna_token_to_local[rna_pair_token_idx]
+        flat_pair_idx = (local_prot_token[:, None] * n_rna + local_rna_token[None, :]).reshape(-1)
+        flat_distance = atom_pair_distance.reshape(-1)
+
+        min_distance_flat = flat_distance.new_full((prot_idx.shape[0] * n_rna,), float('inf'))
+        min_distance_flat.scatter_reduce_(
+            0, flat_pair_idx, flat_distance, reduce='amin', include_self=True
+        )
+        min_distance = min_distance_flat.view(*pair_shape)
+        pair_valid = torch.isfinite(min_distance)
+
+    soft_target = torch.sigmoid((contact_threshold - min_distance) / contact_temperature)
+    soft_target = torch.where(pair_valid, soft_target, torch.zeros_like(soft_target))
     if pair_valid.sum() == 0:
         return None
-
-    prot_coord = token_coord[prot_idx].float()
-    rna_coord = token_coord[rna_idx].float()
-    pair_distance = torch.cdist(prot_coord, rna_coord)
-    target = (pair_distance <= contact_threshold).to(pair_distance.dtype)
-    target = target * pair_valid.to(target.dtype)
     return {
-        "target": target,
-        "pair_valid_mask": pair_valid,
-        "prot_idx": prot_idx,
-        "rna_idx": rna_idx,
+        'target': soft_target,
+        'distance_target': min_distance,
+        'pair_valid_mask': pair_valid,
+        'prot_idx': prot_idx,
+        'rna_idx': rna_idx,
     }
+
+
+def build_cross_pair_target_contact_map(
+    feat_dict: dict,
+    label_dict: dict,
+    contact_threshold: float,
+) -> Optional[dict[str, torch.Tensor]]:
+    """Construct a protein-token x RNA-token soft contact target map."""
+    return build_cross_pair_distance_target_map(
+        feat_dict=feat_dict,
+        label_dict=label_dict,
+        contact_threshold=contact_threshold,
+    )
 
 
 def compute_per_head_contact_losses(
@@ -143,8 +178,9 @@ def compute_per_head_contact_losses(
 
 
 def compute_diversity_margin_loss(
-    logits: torch.Tensor,
+    contact_probs: torch.Tensor,
     margin: float,
+    pair_valid_mask: Optional[torch.Tensor] = None,
     confidence_margin: float = 0.25,
     ambiguity_weight: float = 1.0,
     eps: float = 1e-6,
@@ -153,15 +189,28 @@ def compute_diversity_margin_loss(
     Penalize near-duplicate proposals and strongly penalize inactive proposals
     whose contact probabilities collapse toward zero.
     """
-    n_head = logits.shape[0]
+    n_head = contact_probs.shape[0]
     if n_head <= 1:
-        return logits.new_zeros(())
+        return contact_probs.new_zeros(())
 
-    probs = torch.sigmoid(logits).float()
-    flat = probs.reshape(n_head, -1)
+    probs = contact_probs.float()
+    if pair_valid_mask is None:
+        valid_flat = torch.ones(
+            probs.shape[-2] * probs.shape[-1],
+            device=probs.device,
+            dtype=torch.bool,
+        )
+    else:
+        if pair_valid_mask.dim() == 3:
+            pair_valid_mask = pair_valid_mask[0]
+        valid_flat = pair_valid_mask.reshape(-1).bool()
+    if valid_flat.sum() == 0:
+        return probs.new_zeros(())
+
+    flat = probs.reshape(n_head, -1)[:, valid_flat]
     flat_norm = flat / (flat.norm(dim=-1, keepdim=True) + eps)
     pairwise = torch.cdist(flat_norm, flat_norm, p=2)
-    upper = torch.triu_indices(n_head, n_head, offset=1, device=probs.device)
+    upper = torch.triu_indices(n_head, n_head, offset=1, device=flat.device)
     pairwise = pairwise[upper[0], upper[1]]
     duplicate_loss = torch.relu(margin - pairwise).mean()
 
@@ -354,11 +403,16 @@ class KWayCrossPairProposal(nn.Module):
 
     def __init__(
         self,
+        c_s: int = 384,
         c_z: int = 128,
         hidden_dim: int = 128,
         num_heads: int = 4,
         slot_attn_heads: int = 4,
         delta_scale: float = 1.0,
+        single_delta_scale: float = 1.0,
+        delta_clip_norm: float = 4.0,
+        training_routing_top_k: int = 4,
+        training_routing_temperature: float = 0.25,
         head_slot_init: str = "random",
         head_slot_init_scale: float = 1.0,
         token_feature_dim: int = _TOKEN_FEATURE_DIM,
@@ -384,11 +438,16 @@ class KWayCrossPairProposal(nn.Module):
         enable: bool = False,
     ) -> None:
         super(KWayCrossPairProposal, self).__init__()
+        self.c_s = c_s
         self.c_z = c_z
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
         self.slot_attn_heads = slot_attn_heads
         self.delta_scale = delta_scale
+        self.single_delta_scale = single_delta_scale
+        self.delta_clip_norm = delta_clip_norm
+        self.training_routing_top_k = training_routing_top_k
+        self.training_routing_temperature = training_routing_temperature
         self.head_slot_init = head_slot_init
         self.head_slot_init_scale = head_slot_init_scale
         self.token_feature_dim = token_feature_dim
@@ -506,6 +565,17 @@ class KWayCrossPairProposal(nn.Module):
         self.geometry_out_ln = nn.LayerNorm(hidden_dim)
         self.geometry_head_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
         self.geometry_head_ln = nn.LayerNorm(hidden_dim)
+        self.prot_single_proj = nn.Linear(c_s, hidden_dim, bias=False)
+        self.rna_single_proj = nn.Linear(c_s, hidden_dim, bias=False)
+        self.single_pair_pool_ln = nn.LayerNorm(hidden_dim)
+        self.single_head_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.single_head_ln = nn.LayerNorm(hidden_dim)
+        self.prot_single_delta_proj = nn.Linear(hidden_dim, c_s, bias=False)
+        self.prot_single_delta_ln = nn.LayerNorm(c_s)
+        self.rna_single_delta_proj = nn.Linear(hidden_dim, c_s, bias=False)
+        self.rna_single_delta_ln = nn.LayerNorm(c_s)
+        self.single_delta_head_proj = nn.Linear(hidden_dim, c_s, bias=False)
+        self.single_delta_head_ln = nn.LayerNorm(c_s)
         self.content_delta_pair_pr_proj = nn.Linear(hidden_dim, c_z, bias=False)
         self.content_delta_pair_pr_ln = nn.LayerNorm(c_z)
         self.content_delta_head_pr_proj = nn.Linear(hidden_dim, c_z, bias=False)
@@ -608,6 +678,28 @@ class KWayCrossPairProposal(nn.Module):
     ) -> torch.Tensor:
         return pair_delta_bias.unsqueeze(0) * head_delta_bias[:, None, None, :]
 
+    def _apply_delta_clip(self, delta: torch.Tensor, clip_norm: float, eps: float = 1e-6) -> torch.Tensor:
+        if clip_norm <= 0:
+            return delta
+        delta_norm = delta.norm(dim=-1, keepdim=True)
+        scale = torch.clamp(clip_norm / (delta_norm + eps), max=1.0)
+        return delta * scale
+
+    def _build_single_transition_feature(
+        self,
+        pair_feature: torch.Tensor,
+        single_feature: Optional[torch.Tensor],
+        single_proj: nn.Module,
+        reduce_dim: int,
+    ) -> torch.Tensor:
+        pooled_pair = pair_feature.mean(dim=reduce_dim)
+        if single_feature is None:
+            single_term = pooled_pair.new_zeros(pooled_pair.shape)
+        else:
+            single_term = single_proj(single_feature.to(dtype=pooled_pair.dtype))
+        return self.single_pair_pool_ln(pooled_pair + single_term)
+
+
     def _compute_content_prior_bias_bank(
         self,
         pair_content: torch.Tensor,
@@ -701,6 +793,8 @@ class KWayCrossPairProposal(nn.Module):
     def forward(
         self,
         z_pr: torch.Tensor,
+        prot_single: Optional[torch.Tensor] = None,
+        rna_single: Optional[torch.Tensor] = None,
         prot_token_feat: Optional[torch.Tensor] = None,
         rna_token_feat: Optional[torch.Tensor] = None,
         bio_pair_feat: Optional[torch.Tensor] = None,
@@ -725,6 +819,16 @@ class KWayCrossPairProposal(nn.Module):
         local_z_rms = z_pr.float().pow(2).mean(dim=-1, keepdim=True).sqrt()
         local_z_rms = local_z_rms.to(dtype=z_pr.dtype)
         delta_feature_scale = math.sqrt(self.c_z) * local_z_rms
+        if prot_single is None:
+            prot_single_rms = z_pr.new_ones((z_pr.shape[0], 1))
+        else:
+            prot_single_rms = prot_single.float().pow(2).mean(dim=-1, keepdim=True).sqrt()
+            prot_single_rms = prot_single_rms.to(dtype=z_pr.dtype)
+        if rna_single is None:
+            rna_single_rms = z_pr.new_ones((z_pr.shape[1], 1))
+        else:
+            rna_single_rms = rna_single.float().pow(2).mean(dim=-1, keepdim=True).sqrt()
+            rna_single_rms = rna_single_rms.to(dtype=z_pr.dtype)
 
         pooled = h.mean(dim=(0, 1))
         dynamic_queries = self.query_mlp(self.query_ln(pooled)).view(
@@ -756,6 +860,18 @@ class KWayCrossPairProposal(nn.Module):
         pair_geometry = self._build_geometry_pair_feature(
             h=h,
             geom_pair_feat=geom_pair_feat,
+        )
+        prot_transition = self._build_single_transition_feature(
+            pair_feature=pair_content + pair_geometry,
+            single_feature=prot_single,
+            single_proj=self.prot_single_proj,
+            reduce_dim=1,
+        )
+        rna_transition = self._build_single_transition_feature(
+            pair_feature=pair_content + pair_geometry,
+            single_feature=rna_single,
+            single_proj=self.rna_single_proj,
+            reduce_dim=0,
         )
         content_prior_bias_bank = self._compute_content_prior_bias_bank(
             pair_content=pair_content,
@@ -800,6 +916,16 @@ class KWayCrossPairProposal(nn.Module):
             ),
             "pair_delta_pr_bias": self.delta_pair_pr_ln(self.delta_pair_pr_proj(h)),
             "pair_delta_rp_bias": self.delta_pair_rp_ln(self.delta_pair_rp_proj(h)),
+            "prot_transition": prot_transition,
+            "rna_transition": rna_transition,
+            "prot_single_delta_bias": self.prot_single_delta_ln(
+                self.prot_single_delta_proj(prot_transition)
+            ),
+            "rna_single_delta_bias": self.rna_single_delta_ln(
+                self.rna_single_delta_proj(rna_transition)
+            ),
+            "prot_single_rms": prot_single_rms,
+            "rna_single_rms": rna_single_rms,
         }
         return logits, proposal_state
 
@@ -824,7 +950,7 @@ class KWayCrossPairProposal(nn.Module):
         self,
         proposal_state: dict[str, torch.Tensor],
         head_indices: int | list[int] | torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Lazily decode deltas only for the selected heads.
 
@@ -835,6 +961,8 @@ class KWayCrossPairProposal(nn.Module):
         Returns:
             delta_pr: [K_sel, N_protein_token, N_rna_token, c_z]
             delta_rp: [K_sel, N_protein_token, N_rna_token, c_z]
+            delta_s_prot: [K_sel, N_protein_token, c_s]
+            delta_s_rna: [K_sel, N_rna_token, c_s]
         """
         if not torch.is_tensor(head_indices):
             head_indices = torch.as_tensor(
@@ -851,6 +979,10 @@ class KWayCrossPairProposal(nn.Module):
         )
         head_delta_rp_bias = self.delta_head_rp_ln(
             self.delta_head_rp_proj(head_queries)
+        )
+        head_single = self.single_head_ln(self.single_head_proj(head_queries))
+        head_single_delta_bias = self.single_delta_head_ln(
+            self.single_delta_head_proj(head_single)
         )
         content_head_delta_pr_bias = self.content_delta_head_pr_ln(
             self.content_delta_head_pr_proj(head_content)
@@ -910,10 +1042,28 @@ class KWayCrossPairProposal(nn.Module):
             + self.content_delta_scale * content_delta_rp_shift
             + self.geometry_delta_scale * geometry_delta_rp_shift
         )
-        delta_pr_unit = F.normalize(delta_pr_raw, p=2, dim=-1, eps=1e-6)
-        delta_rp_unit = F.normalize(delta_rp_raw, p=2, dim=-1, eps=1e-6)
+        prot_single_bias = proposal_state["prot_single_delta_bias"].unsqueeze(0)
+        rna_single_bias = proposal_state["rna_single_delta_bias"].unsqueeze(0)
+        delta_s_prot_raw = prot_single_bias * head_single_delta_bias[:, None, :]
+        delta_s_rna_raw = rna_single_bias * head_single_delta_bias[:, None, :]
+
+        delta_pr_raw = self._apply_delta_clip(delta_pr_raw, self.delta_clip_norm)
+        delta_rp_raw = self._apply_delta_clip(delta_rp_raw, self.delta_clip_norm)
+        delta_s_prot_raw = self._apply_delta_clip(delta_s_prot_raw, self.delta_clip_norm)
+        delta_s_rna_raw = self._apply_delta_clip(delta_s_rna_raw, self.delta_clip_norm)
+
         delta_scale = self.delta_scale * proposal_state["delta_feature_scale"].unsqueeze(0)
+        prot_gate = delta_gate.mean(dim=2)
+        rna_gate = delta_gate.mean(dim=1)
+        delta_s_prot_scale = (
+            self.single_delta_scale * proposal_state["prot_single_rms"].unsqueeze(0)
+        )
+        delta_s_rna_scale = (
+            self.single_delta_scale * proposal_state["rna_single_rms"].unsqueeze(0)
+        )
         return (
-            delta_gate * delta_scale * delta_pr_unit,
-            delta_gate * delta_scale * delta_rp_unit,
+            delta_gate * delta_scale * delta_pr_raw,
+            delta_gate * delta_scale * delta_rp_raw,
+            prot_gate * delta_s_prot_scale * delta_s_prot_raw,
+            rna_gate * delta_s_rna_scale * delta_s_rna_raw,
         )

@@ -33,8 +33,8 @@ from protenix.model.modules.confidence import ConfidenceHead
 from protenix.model.modules.cross_pair_proposal import (
     atom_mask_to_token_mask,
     build_cross_pair_pair_feature_tensors,
-    build_cross_pair_token_feature_tensor,
     build_cross_pair_target_contact_map,
+    build_cross_pair_token_feature_tensor,
     compute_per_head_contact_losses,
     KWayCrossPairProposal,
 )
@@ -144,18 +144,18 @@ class Protenix(nn.Module):
         self.diffusion_module = DiffusionModule(**configs.model.diffusion_module)
         self.distogram_head = DistogramHead(**configs.model.distogram_head)
         self.confidence_head = ConfidenceHead(**configs.model.confidence_head)
-        self.cross_pair_proposal_enabled = configs.model.cross_pair_proposal.enable
-        self.cross_pair_proposal = (
-            KWayCrossPairProposal(**configs.model.cross_pair_proposal)
-            if self.cross_pair_proposal_enabled
-            else None
-        )
-
         self.c_s, self.c_z, self.c_s_inputs = (
             configs.c_s,
             configs.c_z,
             configs.c_s_inputs,
         )
+        self.cross_pair_proposal_enabled = configs.model.cross_pair_proposal.enable
+        self.cross_pair_proposal = (
+            KWayCrossPairProposal(c_s=self.c_s, **configs.model.cross_pair_proposal)
+            if self.cross_pair_proposal_enabled
+            else None
+        )
+
         self.linear_no_bias_sinit = LinearNoBias(
             in_features=self.c_s_inputs, out_features=self.c_s
         )
@@ -393,30 +393,104 @@ class Protenix(nn.Module):
             cache["p_lm/c_l"] = [None, None]
         return cache
 
-    def _inject_cross_pair_delta(
+    def _inject_cross_pair_transition(
         self,
+        s: torch.Tensor,
         z: torch.Tensor,
         prot_idx: torch.Tensor,
         rna_idx: torch.Tensor,
         delta_pr: torch.Tensor,
         delta_rp: torch.Tensor,
-    ) -> torch.Tensor:
+        delta_s_prot: torch.Tensor,
+        delta_s_rna: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        s_mod = s.clone()
         z_mod = z.clone()
         delta_pr = delta_pr.to(dtype=z_mod.dtype, device=z_mod.device)
         delta_rp = delta_rp.to(dtype=z_mod.dtype, device=z_mod.device)
+        delta_s_prot = delta_s_prot.to(dtype=s_mod.dtype, device=s_mod.device)
+        delta_s_rna = delta_s_rna.to(dtype=s_mod.dtype, device=s_mod.device)
         z_mod[prot_idx[:, None], rna_idx[None, :], :] = (
             z_mod[prot_idx[:, None], rna_idx[None, :], :] + delta_pr
         )
         z_mod[rna_idx[:, None], prot_idx[None, :], :] = (
             z_mod[rna_idx[:, None], prot_idx[None, :], :] + delta_rp.transpose(0, 1)
         )
-        return z_mod
+        s_mod.index_add_(0, prot_idx, delta_s_prot)
+        s_mod.index_add_(0, rna_idx, delta_s_rna)
+        return s_mod, z_mod
+
+    def _masked_cross_pair_mean(
+        self,
+        value: torch.Tensor,
+        pair_valid_mask: Optional[torch.Tensor],
+        eps: float = 1e-6,
+    ) -> torch.Tensor:
+        value = value.to(torch.float32)
+        if pair_valid_mask is None:
+            return value.mean()
+        mask = pair_valid_mask.to(device=value.device, dtype=torch.float32)
+        if mask.dim() == 3:
+            mask = mask[0]
+        return (value * mask).sum() / (mask.sum() + eps)
+
+    def _soft_contact_jaccard(
+        self,
+        contact_a: torch.Tensor,
+        contact_b: torch.Tensor,
+        pair_valid_mask: Optional[torch.Tensor],
+        eps: float = 1e-6,
+    ) -> torch.Tensor:
+        contact_a = contact_a.to(torch.float32)
+        contact_b = contact_b.to(torch.float32)
+        if pair_valid_mask is None:
+            mask = torch.ones_like(contact_a, dtype=torch.float32)
+        else:
+            mask = pair_valid_mask.to(device=contact_a.device, dtype=torch.float32)
+            if mask.dim() == 3:
+                mask = mask[0]
+        intersection = (torch.minimum(contact_a, contact_b) * mask).sum()
+        union = (torch.maximum(contact_a, contact_b) * mask).sum()
+        return intersection / (union + eps)
+
+    def _high_prob_region_l1(
+        self,
+        contact_a: torch.Tensor,
+        contact_b: torch.Tensor,
+        pair_valid_mask: Optional[torch.Tensor],
+        prob_threshold: float = 0.5,
+        eps: float = 1e-6,
+    ) -> torch.Tensor:
+        contact_a = contact_a.to(torch.float32)
+        contact_b = contact_b.to(torch.float32)
+        if pair_valid_mask is None:
+            valid_mask = torch.ones_like(contact_a, dtype=torch.bool)
+        else:
+            valid_mask = pair_valid_mask.to(device=contact_a.device, dtype=torch.bool)
+            if valid_mask.dim() == 3:
+                valid_mask = valid_mask[0]
+
+        active_mask = (
+            (contact_a >= prob_threshold) | (contact_b >= prob_threshold)
+        ) & valid_mask
+        if active_mask.sum() == 0:
+            return contact_a.new_zeros(())
+
+        diff = torch.abs(contact_a - contact_b)
+        active_mask = active_mask.to(dtype=diff.dtype)
+        return (diff * active_mask).sum() / (active_mask.sum() + eps)
+
+    def _mean_delta_norm(
+        self,
+        delta: torch.Tensor,
+    ) -> torch.Tensor:
+        return delta.to(torch.float32).norm(dim=-1).mean()
 
     def _decode_cross_pair_head_deltas(
         self,
         proposal_data: dict[str, Any],
         head_indices: int | list[int] | torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         return self.cross_pair_proposal.decode_selected_heads(
             proposal_state=proposal_data["state"],
             head_indices=head_indices,
@@ -424,6 +498,7 @@ class Protenix(nn.Module):
 
     def _get_cross_pair_proposal_data(
         self,
+        s: torch.Tensor,
         z: torch.Tensor,
         input_feature_dict: dict[str, Any],
     ) -> Optional[dict[str, Any]]:
@@ -441,7 +516,10 @@ class Protenix(nn.Module):
         rna_idx = torch.nonzero(rna_token_mask, as_tuple=False).squeeze(-1)
         if prot_idx.numel() == 0 or rna_idx.numel() == 0:
             return None
+
         z_pr = z[prot_idx[:, None], rna_idx[None, :], :]
+        prot_single = s.index_select(0, prot_idx)
+        rna_single = s.index_select(0, rna_idx)
         has_frame = input_feature_dict.get("has_frame")
         prot_has_frame = (
             has_frame.index_select(0, prot_idx) if has_frame is not None else None
@@ -467,6 +545,8 @@ class Protenix(nn.Module):
         )
         logits, proposal_state = self.cross_pair_proposal(
             z_pr,
+            prot_single=prot_single,
+            rna_single=rna_single,
             prot_token_feat=prot_token_feat,
             rna_token_feat=rna_token_feat,
             bio_pair_feat=bio_pair_feat,
@@ -481,12 +561,12 @@ class Protenix(nn.Module):
             "rna_idx": rna_idx,
         }
 
-    def _select_training_cross_pair_head(
+    def _select_training_cross_pair_route(
         self,
         proposal_data: Optional[dict[str, Any]],
         feat_dict: dict[str, Any],
         label_dict: dict[str, Any],
-    ) -> tuple[Optional[int], Optional[dict[str, torch.Tensor]]]:
+    ) -> tuple[Optional[dict[str, torch.Tensor]], Optional[dict[str, torch.Tensor]]]:
         if proposal_data is None:
             return None, None
         target_dict = build_cross_pair_target_contact_map(
@@ -504,8 +584,11 @@ class Protenix(nn.Module):
             pos_weight=self.configs.loss.cross_pair_proposal.pos_weight,
             eps=self.configs.loss.cross_pair_proposal.eps,
         )
-        selected_idx = int(per_head_loss.argmin().item())
-        return selected_idx, target_dict
+        best_idx = torch.argmin(per_head_loss)
+        return {
+            "head_indices": best_idx.view(1),
+            "per_head_loss": per_head_loss,
+        }, target_dict
 
     def _run_training_diffusion_branch(
         self,
@@ -736,23 +819,26 @@ class Protenix(nn.Module):
 
             head_scores = []
             for head_idx in range(n_head):
-                delta_pr, delta_rp = self._decode_cross_pair_head_deltas(
+                delta_pr, delta_rp, delta_s_prot, delta_s_rna = self._decode_cross_pair_head_deltas(
                     proposal_data=proposal_data,
                     head_indices=head_idx,
                 )
-                z_k = self._inject_cross_pair_delta(
+                s_k, z_k = self._inject_cross_pair_transition(
+                    s=s,
                     z=z,
                     prot_idx=proposal_data["prot_idx"],
                     rna_idx=proposal_data["rna_idx"],
                     delta_pr=delta_pr[0],
                     delta_rp=delta_rp[0],
+                    delta_s_prot=delta_s_prot[0],
+                    delta_s_rna=delta_s_rna[0],
                 )
                 cache = self._prepare_diffusion_cache(input_feature_dict, z_k)
                 coordinate_mini = self.sample_diffusion(
                     denoise_net=self.diffusion_module,
                     input_feature_dict=input_feature_dict,
                     s_inputs=s_inputs,
-                    s_trunk=s,
+                    s_trunk=s_k,
                     z_trunk=None if cache["pair_z"] is not None else z_k,
                     pair_z=None if cache["pair_z"] is None else cache["pair_z"],
                     p_lm=cache["p_lm/c_l"][0],
@@ -774,7 +860,7 @@ class Protenix(nn.Module):
                 plddt_k, pae_k, pde_k, _ = self.run_confidence_head(
                     input_feature_dict=input_feature_dict,
                     s_inputs=s_inputs,
-                    s_trunk=s,
+                    s_trunk=s_k,
                     z_trunk=z_k,
                     pair_mask=None,
                     x_pred_coords=coordinate_mini,
@@ -1147,7 +1233,7 @@ class Protenix(nn.Module):
                 elements_one_hot=input_feature_dict["ref_element"],
             )
             return pred_dict, log_dict, time_tracker
-        proposal_data = self._get_cross_pair_proposal_data(z, input_feature_dict)
+        proposal_data = self._get_cross_pair_proposal_data(s, z, input_feature_dict)
         if proposal_data is None:
             pred_dict, branch_time_tracker = self._run_inference_for_z(
                 input_feature_dict=input_feature_dict,
@@ -1178,7 +1264,7 @@ class Protenix(nn.Module):
             n_head = proposal_scores.size(0)
             num_active_heads = min(n_head, N_sample)
             top_ids = torch.argsort(proposal_scores, descending=True)[:num_active_heads]
-            top_delta_pr, top_delta_rp = self._decode_cross_pair_head_deltas(
+            top_delta_pr, top_delta_rp, top_delta_s_prot, top_delta_s_rna = self._decode_cross_pair_head_deltas(
                 proposal_data=proposal_data,
                 head_indices=top_ids,
             )
@@ -1193,17 +1279,20 @@ class Protenix(nn.Module):
                 cur_n_sample = base_samples + int(rank < residual)
                 if cur_n_sample == 0:
                     continue
-                z_k = self._inject_cross_pair_delta(
+                s_k, z_k = self._inject_cross_pair_transition(
+                    s=s,
                     z=z,
                     prot_idx=proposal_data["prot_idx"],
                     rna_idx=proposal_data["rna_idx"],
                     delta_pr=top_delta_pr[rank],
                     delta_rp=top_delta_rp[rank],
+                    delta_s_prot=top_delta_s_prot[rank],
+                    delta_s_rna=top_delta_s_rna[rank],
                 )
                 pred_k, time_k = self._run_inference_for_z(
                     input_feature_dict=input_feature_dict,
                     s_inputs=s_inputs,
-                    s=s,
+                    s=s_k,
                     z=z_k,
                     N_cycle=N_cycle,
                     mode=mode,
@@ -1293,33 +1382,83 @@ class Protenix(nn.Module):
         log_dict = {}
         pred_dict = {}
 
-        proposal_data = self._get_cross_pair_proposal_data(z, input_feature_dict)
+        proposal_data = self._get_cross_pair_proposal_data(s, z, input_feature_dict)
         pred_dict["cross_pair_logits"] = (
             proposal_data["logits"] if proposal_data is not None else None
         )
-        selected_head_idx, target_contact_dict = self._select_training_cross_pair_head(
+        selected_route, target_contact_dict = self._select_training_cross_pair_route(
             proposal_data=proposal_data,
             feat_dict=input_feature_dict,
             label_dict=label_dict,
         )
-        if selected_head_idx is not None:
-            selected_delta_pr, selected_delta_rp = self._decode_cross_pair_head_deltas(
+        primary_head_idx = None
+        selected_contact_probs = None
+        pair_valid_mask = None
+        if selected_route is not None:
+            route_head_indices = selected_route["head_indices"]
+            primary_head_idx = int(route_head_indices[0].item())
+            selected_delta_pr, selected_delta_rp, selected_delta_s_prot, selected_delta_s_rna = self._decode_cross_pair_head_deltas(
                 proposal_data=proposal_data,
-                head_indices=selected_head_idx,
+                head_indices=route_head_indices,
             )
-            z_base = z
-            z = self._inject_cross_pair_delta(
+            s_base, z_base = s, z
+            s, z = self._inject_cross_pair_transition(
+                s=s,
                 z=z,
                 prot_idx=proposal_data["prot_idx"],
                 rna_idx=proposal_data["rna_idx"],
                 delta_pr=selected_delta_pr[0],
                 delta_rp=selected_delta_rp[0],
+                delta_s_prot=selected_delta_s_prot[0],
+                delta_s_rna=selected_delta_s_rna[0],
             )
-            pred_dict["cross_pair_selected_idx"] = torch.tensor(
-                selected_head_idx, device=z.device, dtype=torch.long
+            selected_contact_probs = torch.sigmoid(
+                proposal_data["logits"][primary_head_idx]
             )
+            pair_valid_mask = target_contact_dict["pair_valid_mask"]
+            pred_dict["cross_pair_selected_idx"] = route_head_indices[0]
             pred_dict["cross_pair_target"] = target_contact_dict["target"]
-            pred_dict["cross_pair_valid_mask"] = target_contact_dict["pair_valid_mask"]
+            pred_dict["cross_pair_valid_mask"] = pair_valid_mask
+            per_head_loss = selected_route["per_head_loss"].detach()
+            sorted_per_head_loss, _ = torch.sort(per_head_loss)
+            second_best_loss = (
+                sorted_per_head_loss[1]
+                if sorted_per_head_loss.numel() > 1
+                else sorted_per_head_loss[0]
+            )
+            log_dict.update(
+                {
+                    "cross_pair_selected_idx": route_head_indices[0].detach(),
+                    "cross_pair_selected_loss": per_head_loss[primary_head_idx],
+                    "cross_pair_second_best_loss": second_best_loss,
+                    "cross_pair_selection_margin": (
+                        second_best_loss - per_head_loss[primary_head_idx]
+                    ),
+                    "cross_pair_target_density": self._masked_cross_pair_mean(
+                        target_contact_dict["target"], pair_valid_mask
+                    ),
+                    "cross_pair_selected_density": self._masked_cross_pair_mean(
+                        selected_contact_probs, pair_valid_mask
+                    ),
+                    "cross_pair_selected_target_jaccard": self._soft_contact_jaccard(
+                        selected_contact_probs,
+                        target_contact_dict["target"],
+                        pair_valid_mask,
+                    ),
+                    "cross_pair_selected_delta_pr_norm": self._mean_delta_norm(
+                        selected_delta_pr[0]
+                    ),
+                    "cross_pair_selected_delta_rp_norm": self._mean_delta_norm(
+                        selected_delta_rp[0]
+                    ),
+                    "cross_pair_selected_delta_s_prot_norm": self._mean_delta_norm(
+                        selected_delta_s_prot[0]
+                    ),
+                    "cross_pair_selected_delta_s_rna_norm": self._mean_delta_norm(
+                        selected_delta_s_rna[0]
+                    ),
+                }
+            )
 
         cache = self._prepare_diffusion_cache(input_feature_dict, z)
         # Mini-rollout: used for confidence and label permutation
@@ -1462,7 +1601,7 @@ class Protenix(nn.Module):
             candidate_heads = [
                 idx
                 for idx in range(proposal_data["logits"].shape[0])
-                if idx != selected_head_idx
+                if idx != primary_head_idx
             ]
             if len(candidate_heads) == 0:
                 candidate_heads = list(range(proposal_data["logits"].shape[0]))
@@ -1474,22 +1613,75 @@ class Protenix(nn.Module):
                     )
                 }
             )
+            random_contact_probs = torch.sigmoid(proposal_data["logits"][random_head_idx])
+            log_dict.update(
+                {
+                    "cross_pair_random_head_idx": pred_dict[
+                        "cross_pair_random_head_idx"
+                    ].detach(),
+                    "cross_pair_random_density": self._masked_cross_pair_mean(
+                        random_contact_probs, pair_valid_mask
+                    ),
+                }
+            )
+            if target_contact_dict is not None:
+                log_dict["cross_pair_random_target_jaccard"] = (
+                    self._soft_contact_jaccard(
+                        random_contact_probs,
+                        target_contact_dict["target"],
+                        pair_valid_mask,
+                    )
+                )
+            if selected_contact_probs is not None:
+                log_dict["cross_pair_selected_random_jaccard"] = (
+                    self._soft_contact_jaccard(
+                        selected_contact_probs,
+                        random_contact_probs,
+                        pair_valid_mask,
+                    )
+                )
+                log_dict["cross_pair_selected_random_l1"] = (
+                    self._high_prob_region_l1(
+                        selected_contact_probs,
+                        random_contact_probs,
+                        pair_valid_mask,
+                    )
+                )
             if quality_aux_enabled and z_base is not None:
-                random_delta_pr, random_delta_rp = self._decode_cross_pair_head_deltas(
+                random_delta_pr, random_delta_rp, random_delta_s_prot, random_delta_s_rna = self._decode_cross_pair_head_deltas(
                     proposal_data=proposal_data,
                     head_indices=random_head_idx,
                 )
-                z_random = self._inject_cross_pair_delta(
+                log_dict.update(
+                    {
+                        "cross_pair_random_delta_pr_norm": self._mean_delta_norm(
+                            random_delta_pr[0]
+                        ),
+                        "cross_pair_random_delta_rp_norm": self._mean_delta_norm(
+                            random_delta_rp[0]
+                        ),
+                        "cross_pair_random_delta_s_prot_norm": self._mean_delta_norm(
+                            random_delta_s_prot[0]
+                        ),
+                        "cross_pair_random_delta_s_rna_norm": self._mean_delta_norm(
+                            random_delta_s_rna[0]
+                        ),
+                    }
+                )
+                s_random, z_random = self._inject_cross_pair_transition(
+                    s=s_base,
                     z=z_base,
                     prot_idx=proposal_data["prot_idx"],
                     rna_idx=proposal_data["rna_idx"],
                     delta_pr=random_delta_pr[0],
                     delta_rp=random_delta_rp[0],
+                    delta_s_prot=random_delta_s_prot[0],
+                    delta_s_rna=random_delta_s_rna[0],
                 )
                 random_branch_pred = self._run_quality_only_diffusion_branch(
                     input_feature_dict=input_feature_dict,
                     s_inputs=s_inputs,
-                    s=s,
+                    s=s_random,
                     z_branch=z_random,
                     inplace_safe=inplace_safe,
                     diffusion_batch_size=self.configs.model.cross_pair_proposal.random_branch_diffusion_batch_size,

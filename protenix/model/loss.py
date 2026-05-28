@@ -1547,9 +1547,11 @@ class CrossPairProposalLoss(nn.Module):
             -per_head / self.softmin_temperature,
             dim=0,
         )
+        contact_probs = torch.sigmoid(logits)
         diversity_loss = compute_diversity_margin_loss(
-            logits=logits,
+            contact_probs=contact_probs,
             margin=self.diversity_margin,
+            pair_valid_mask=target_dict["pair_valid_mask"],
             confidence_margin=self.diversity_confidence_margin,
             ambiguity_weight=self.diversity_ambiguity_weight,
             eps=self.eps,

@@ -125,6 +125,8 @@ class AF3Trainer(object):
                 id=self.configs.wandb_id or None,
             )
         self.train_metric_wrapper = SimpleMetricAggregator(["avg"])
+        self.train_cross_pair_metric_wrapper = SimpleMetricAggregator(["avg"])
+        self.latest_cross_pair_log: Dict[str, float] = {}
 
     def init_env(self) -> None:
         """
@@ -407,6 +409,106 @@ class AF3Trainer(object):
         if DIST_WRAPPER.rank == 0:
             logging.info(msg)
 
+    def _scalarize_log_value(self, value: Any) -> float:
+        if isinstance(value, torch.Tensor):
+            return float(value.detach().reshape(-1)[0].item())
+        return float(value)
+
+    def _update_cross_pair_summary(self, log_dict: Dict[str, Any]) -> None:
+        metric_keys = [
+            "cross_pair_selection_margin",
+            "cross_pair_selected_target_jaccard",
+            "cross_pair_random_target_jaccard",
+            "cross_pair_selected_density",
+            "cross_pair_random_density",
+            "cross_pair_selected_random_jaccard",
+            "cross_pair_selected_random_l1",
+            "cross_pair_selected_delta_pr_norm",
+            "cross_pair_selected_delta_rp_norm",
+            "cross_pair_selected_delta_s_prot_norm",
+            "cross_pair_selected_delta_s_rna_norm",
+            "cross_pair_random_delta_pr_norm",
+            "cross_pair_random_delta_rp_norm",
+            "cross_pair_random_delta_s_prot_norm",
+            "cross_pair_random_delta_s_rna_norm",
+        ]
+        for key in metric_keys:
+            if key in log_dict:
+                self.train_cross_pair_metric_wrapper.add(
+                    key, log_dict[key], namespace="train"
+                )
+
+        latest_keys = ["cross_pair_selected_idx", "cross_pair_random_head_idx"]
+        for key in latest_keys:
+            if key in log_dict:
+                self.latest_cross_pair_log[key] = self._scalarize_log_value(log_dict[key])
+
+    def _format_cross_pair_summary(self) -> str:
+        metrics = self.train_cross_pair_metric_wrapper.calc()
+        if len(metrics) == 0:
+            return ""
+
+        def get_metric(name: str) -> Any:
+            return metrics.get(f"train/{name}.avg")
+
+        def fmt(name: str, digits: int = 3) -> str:
+            value = get_metric(name)
+            if value is None:
+                return "--"
+            return f"{float(value):.{digits}f}"
+
+        def fmt_head(name: str) -> str:
+            value = self.latest_cross_pair_log.get(name)
+            if value is None:
+                return "--"
+            return str(int(round(value)))
+
+        best_delta = "/".join(
+            [
+                fmt("cross_pair_selected_delta_pr_norm"),
+                fmt("cross_pair_selected_delta_rp_norm"),
+                fmt("cross_pair_selected_delta_s_prot_norm"),
+                fmt("cross_pair_selected_delta_s_rna_norm"),
+            ]
+        )
+        rand_delta = "/".join(
+            [
+                fmt("cross_pair_random_delta_pr_norm"),
+                fmt("cross_pair_random_delta_rp_norm"),
+                fmt("cross_pair_random_delta_s_prot_norm"),
+                fmt("cross_pair_random_delta_s_rna_norm"),
+            ]
+        )
+
+        return "\n".join(
+            [
+                "CrossPair摘要:",
+                (
+                    f"  头选择: best={fmt_head('cross_pair_selected_idx')}, "
+                    f"rand={fmt_head('cross_pair_random_head_idx')}, "
+                    f"margin={fmt('cross_pair_selection_margin')} "
+                    "（越大说明 best head 更明确）"
+                ),
+                (
+                    f"  对目标: best重叠={fmt('cross_pair_selected_target_jaccard')}, "
+                    f"rand重叠={fmt('cross_pair_random_target_jaccard')}, "
+                    f"best密度={fmt('cross_pair_selected_density')}, "
+                    f"rand密度={fmt('cross_pair_random_density')} "
+                    "（重叠越高越贴近目标界面，密度过低/过高都不理想）"
+                ),
+                (
+                    f"  头差异: 重叠={fmt('cross_pair_selected_random_jaccard')}, "
+                    f"高概率区L1={fmt('cross_pair_selected_random_l1')} "
+                    "（只在 best/rand 任一方概率>=0.5 的区域计算；重叠低、L1高说明不同 head 更像不同结合模式）"
+                ),
+                (
+                    f"  注入强度: best[zpr/zrp/sP/sR]={best_delta}, "
+                    f"rand[zpr/zrp/sP/sR]={rand_delta} "
+                    "（长期接近 0 说明 proposal 没真正带动 trunk）"
+                ),
+            ]
+        )
+
     def model_forward(
         self, batch: Dict[str, Any], mode: str = "train"
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
@@ -624,8 +726,10 @@ class AF3Trainer(object):
         )
 
         with enable_amp:
-            batch, _ = self.model_forward(batch, mode="train")
+            batch, log_dict = self.model_forward(batch, mode="train")
             loss, loss_dict, _ = self.get_loss(batch, mode="train")
+
+        self._update_cross_pair_summary(log_dict)
 
         if self.configs.dtype in ["bf16", "fp32"]:
             if is_loss_nan_check(loss):
@@ -721,6 +825,9 @@ class AF3Trainer(object):
                 if step_need_log or is_last_step:
                     metrics = self.train_metric_wrapper.calc()
                     self.print(f"Step {self.step} train metrics: {metrics}")
+                    cross_pair_summary = self._format_cross_pair_summary()
+                    if cross_pair_summary:
+                        self.print(cross_pair_summary)
                     last_lr = self.lr_scheduler.get_last_lr()
                     if DIST_WRAPPER.rank == 0:
                         if self.configs.use_wandb:
