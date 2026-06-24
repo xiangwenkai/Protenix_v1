@@ -4,6 +4,7 @@ from protenix.model.eclip_binding import (
     EclipSignalLoss,
     align_signal_to_prediction,
     binary_auprc,
+    compute_distogram_binding_score,
     compute_soft_binding_score,
     masked_pearson,
     normalize_log_signal,
@@ -62,6 +63,27 @@ def test_signal_loss_binarizes_signal_and_weights_positives():
     loss.backward()
     assert p_bind.grad is not None
     assert torch.isfinite(p_bind.grad).all()
+
+
+def test_distogram_binding_score_uses_max_protein_contact():
+    contact_probs = torch.tensor(
+        [
+            [0.0, 0.2, 0.9, 0.1],
+            [0.2, 0.0, 0.3, 0.4],
+            [0.9, 0.3, 0.0, 0.8],
+            [0.1, 0.4, 0.8, 0.0],
+        ]
+    )
+    feat_dict = {
+        "atom_to_token_idx": torch.tensor([0, 1, 2, 3]),
+        "is_protein": torch.tensor([1, 1, 0, 0]),
+        "is_rna": torch.tensor([0, 0, 1, 1]),
+    }
+
+    p_bind, rna_tokens = compute_distogram_binding_score(contact_probs, feat_dict)
+
+    assert rna_tokens.tolist() == [2, 3]
+    assert torch.allclose(p_bind, torch.tensor([0.9, 0.4]))
 
 
 def test_point_loss_uses_per_sample_normalized_log_signal():

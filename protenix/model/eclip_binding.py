@@ -55,6 +55,41 @@ def get_rna_token_indices(feat_dict: dict[str, torch.Tensor]) -> torch.Tensor:
     return atom_to_token[rna_atom_mask].unique(sorted=True)
 
 
+def get_protein_token_indices(feat_dict: dict[str, torch.Tensor]) -> torch.Tensor:
+    """Return sorted token indices that contain at least one protein atom."""
+
+    atom_to_token = feat_dict["atom_to_token_idx"].long()
+    protein_atom_mask = feat_dict["is_protein"].bool()
+    if not protein_atom_mask.any():
+        return atom_to_token.new_empty((0,))
+    return atom_to_token[protein_atom_mask].unique(sorted=True)
+
+
+def compute_distogram_binding_score(
+    contact_probs: torch.Tensor,
+    feat_dict: dict[str, torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Use Protenix token-token contact probabilities as RNA binding scores.
+
+    For each RNA token r, binding probability is max_p contact_probs[r, p]
+    over all protein tokens p.
+    """
+
+    rna_token_indices = get_rna_token_indices(feat_dict).to(contact_probs.device)
+    protein_token_indices = get_protein_token_indices(feat_dict).to(contact_probs.device)
+    if rna_token_indices.numel() == 0:
+        raise ValueError("Cannot compute eCLIP binding score: no RNA tokens found.")
+    if protein_token_indices.numel() == 0:
+        raise ValueError("Cannot compute eCLIP binding score: no protein tokens found.")
+
+    rna_protein_contacts = contact_probs[..., rna_token_indices, :].index_select(
+        dim=-1,
+        index=protein_token_indices,
+    )
+    p_bind = rna_protein_contacts.amax(dim=-1)
+    return p_bind, rna_token_indices
+
+
 def compute_soft_binding_score(
     coords: torch.Tensor,
     feat_dict: dict[str, torch.Tensor],
@@ -161,8 +196,8 @@ class EclipSignalLoss(nn.Module):
         self,
         *,
         profile_weight: float = 1.0,
-        positive_weight: float = 5.0,
-        point_weight: float = 2.0,
+        positive_weight: float = 1.0,
+        point_weight: float = 0.2,
         eps: float = 1e-8,
     ) -> None:
         super().__init__()

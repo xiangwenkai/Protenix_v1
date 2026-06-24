@@ -57,13 +57,10 @@ from protenix.data.inference.json_to_feature import SampleDictToFeatures
 from protenix.data.utils import data_type_transform, make_dummy_feature
 from protenix.model import sample_confidence
 from protenix.model.eclip_binding import (
-    EclipBindingScorer,
     EclipSignalLoss,
     align_signal_to_prediction,
     binary_auprc,
-    masked_pearson,
-    masked_std,
-    normalize_log_signal,
+    compute_distogram_binding_score,
     topk_overlap,
 )
 from protenix.model.generator_ppft import sample_diffusion_ppft
@@ -90,7 +87,6 @@ def deep_update(target: dict[str, Any], updates: Mapping[str, Any]) -> dict[str,
 def build_eclip_ppft_checkpoint(
     *,
     model: nn.Module,
-    binding_scorer: EclipBindingScorer,
     signal_loss: EclipSignalLoss,
     optimizer: torch.optim.Optimizer | None,
     scheduler: torch.optim.lr_scheduler.LRScheduler | None,
@@ -104,7 +100,6 @@ def build_eclip_ppft_checkpoint(
         "optimizer": None if optimizer is None else optimizer.state_dict(),
         "scheduler": None if scheduler is None else scheduler.state_dict(),
         "step": step,
-        "eclip_binding_scorer": binding_scorer.state_dict(),
         "eclip_signal_loss": signal_loss.state_dict(),
     }
     if config is not None:
@@ -132,59 +127,50 @@ def _module_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
 
 
 class EclipPPFTForwardModule(nn.Module):
-    """DDP-visible eCLIP forward path over Protenix plus binding scorer."""
+    """DDP-visible eCLIP forward path over Protenix distogram contacts."""
 
     def __init__(
         self,
         model: Protenix,
-        binding_scorer: EclipBindingScorer,
         configs: Any,
         eclip_cfg: Any,
         device: torch.device,
     ) -> None:
         super().__init__()
         self.model = model
-        self.binding_scorer = binding_scorer
         self.configs = configs
         self.eclip_cfg = eclip_cfg
         self.device = device
-
-    def _sync_if_cuda(self) -> None:
-        if self.device.type == "cuda":
-            torch.cuda.synchronize(self.device)
-
-    def _timer_start(self) -> float:
-        self._sync_if_cuda()
-        return time.perf_counter()
-
-    def _timer_elapsed(self, start: float) -> float:
-        self._sync_if_cuda()
-        return time.perf_counter() - start
 
     def forward(
         self, feat_dict: dict[str, torch.Tensor]
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
-        torch.Tensor,
         dict[str, torch.Tensor],
-        dict[str, float],
     ]:
-        timings: dict[str, float] = {}
         n_cycle = self.eclip_cfg.n_cycle
         if n_cycle is None:
             n_cycle = self.model.N_cycle
 
-        start = self._timer_start()
         s_inputs, s, z = self.model.get_pairformer_output(
             input_feature_dict=feat_dict,
             N_cycle=int(n_cycle),
             inplace_safe=self.eclip_cfg.inplace_safe,
             chunk_size=self.eclip_cfg.diffusion_attn_chunk_size,
         )
-        timings["time/pairformer_s"] = self._timer_elapsed(start)
 
-        start = self._timer_start()
+        distogram_logits = self.model.distogram_head(z)
+        contact_probs = sample_confidence.compute_contact_prob(
+            distogram_logits=distogram_logits,
+            **sample_confidence.get_bin_params(self.configs.loss.distogram),
+            thres=self.eclip_cfg.distogram_contact_threshold,
+        )
+        p_bind, _ = compute_distogram_binding_score(contact_probs, feat_dict)
+
+        if self.eclip_cfg.confidence_quality_weight <= 0.0:
+            return p_bind, p_bind.sum() * 0.0, {}
+
         cache = {"pair_z": None, "p_lm/c_l": [None, None]}
         if self.model.enable_diffusion_shared_vars_cache:
             cache["pair_z"] = self.model.diffusion_module.diffusion_conditioning.prepare_cache(
@@ -204,17 +190,13 @@ class EclipPPFTForwardModule(nn.Module):
                 z=cache["pair_z"],
                 inplace_safe=False,
             )
-        timings["time/diffusion_cache_s"] = self._timer_elapsed(start)
 
-        start = self._timer_start()
         noise_schedule = self.model.inference_noise_scheduler(
-            N_step=self.eclip_cfg.n_rollout_steps,
+            N_step=self.eclip_cfg.confidence_rollout_steps,
             device=s_inputs.device,
             dtype=s_inputs.dtype,
         )
-        timings["time/noise_schedule_s"] = self._timer_elapsed(start)
 
-        start = self._timer_start()
         coords = sample_diffusion_ppft(
             denoise_net=self.model.diffusion_module,
             input_feature_dict=feat_dict,
@@ -226,8 +208,8 @@ class EclipPPFTForwardModule(nn.Module):
             c_l=cache["p_lm/c_l"][1],
             noise_schedule=noise_schedule,
             N_sample=1,
-            record_grad_steps=set(self.eclip_cfg.record_grad_steps),
-            detach_unrecorded_steps=self.eclip_cfg.detach_unrecorded_steps,
+            record_grad_steps=(),
+            detach_unrecorded_steps=True,
             gamma0=self.configs.sample_diffusion.gamma0,
             gamma_min=self.configs.sample_diffusion.gamma_min,
             noise_scale_lambda=self.configs.sample_diffusion.noise_scale_lambda,
@@ -236,13 +218,7 @@ class EclipPPFTForwardModule(nn.Module):
             attn_chunk_size=self.eclip_cfg.diffusion_attn_chunk_size,
             enable_efficient_fusion=self.model.enable_efficient_fusion,
         )
-        timings["time/diffusion_rollout_s"] = self._timer_elapsed(start)
 
-        start = self._timer_start()
-        p_bind, _ = self.binding_scorer(coords.float(), feat_dict)
-        timings["time/binding_score_s"] = self._timer_elapsed(start)
-
-        start = self._timer_start()
         quality_loss, quality_metrics = self.confidence_quality_loss(
             feat_dict=feat_dict,
             coords=coords,
@@ -250,8 +226,7 @@ class EclipPPFTForwardModule(nn.Module):
             s=s,
             z=z,
         )
-        timings["time/confidence_quality_s"] = self._timer_elapsed(start)
-        return coords, p_bind, quality_loss, quality_metrics, timings
+        return p_bind, quality_loss, quality_metrics
 
     def confidence_quality_loss(
         self,
@@ -412,29 +387,18 @@ class EclipPPFTTrainer:
         )
 
     def init_loss(self) -> None:
-        self.binding_scorer = EclipBindingScorer(
-            cutoff=self.eclip_cfg.binding_cutoff,
-            temperature=self.eclip_cfg.binding_temperature,
-            softmin_beta=self.eclip_cfg.binding_softmin_beta,
-            learn_temperature=self.eclip_cfg.learn_binding_temperature,
-            learn_softmin_beta=self.eclip_cfg.learn_binding_softmin_beta,
-            protein_atom_chunk_size=self.eclip_cfg.binding_protein_atom_chunk_size,
-        ).to(self.device)
         self.signal_loss = EclipSignalLoss(
             profile_weight=self.eclip_cfg.signal_profile_weight,
             positive_weight=self.eclip_cfg.signal_positive_weight,
             point_weight=self.eclip_cfg.signal_point_weight,
         ).to(self.device)
         if not self.eclip_cfg.train_sidecar:
-            for param in self.binding_scorer.parameters():
-                param.requires_grad_(False)
             for param in self.signal_loss.parameters():
                 param.requires_grad_(False)
 
     def init_train_module(self) -> None:
         self.train_module = EclipPPFTForwardModule(
             model=self.raw_model,
-            binding_scorer=self.binding_scorer,
             configs=self.configs,
             eclip_cfg=self.eclip_cfg,
             device=self.device,
@@ -522,28 +486,17 @@ class EclipPPFTTrainer:
         self.print(f"First trainable params: {selected[:20]}")
 
     def trainable_name_patterns(self) -> list[str]:
-        patterns = [
-            "diffusion_module.diffusion_conditioning",
-            "diffusion_module.atom_attention_decoder",
-            "diffusion_module.layernorm_s",
-            "diffusion_module.linear_no_bias_s",
-            "diffusion_module.layernorm_a",
-        ]
-        n_diff_blocks = int(self.configs.model.diffusion_module.transformer.n_blocks)
-        keep_diff = min(int(self.eclip_cfg.train_last_diffusion_blocks), n_diff_blocks)
-        patterns.extend(
-            f"diffusion_module.diffusion_transformer.blocks.{idx}."
-            for idx in range(n_diff_blocks - keep_diff, n_diff_blocks)
-        )
+        patterns = []
         keep_pair = int(self.eclip_cfg.train_last_pairformer_blocks)
-        if self.eclip_cfg.train_stage == "diffusion_pairformer" or keep_pair > 0:
-            n_pair_blocks = int(self.configs.model.pairformer.n_blocks)
+        n_pair_blocks = int(self.configs.model.pairformer.n_blocks)
+        if keep_pair < 0:
+            patterns.append("pairformer_stack.")
+        elif keep_pair > 0:
             keep_pair = min(keep_pair, n_pair_blocks)
             patterns.extend(
                 f"pairformer_stack.blocks.{idx}."
                 for idx in range(n_pair_blocks - keep_pair, n_pair_blocks)
             )
-            patterns.extend(["linear_no_bias_z_cycle", "linear_no_bias_s"])
         patterns.extend(list(self.eclip_cfg.extra_trainable_substrings))
         return [pattern for pattern in patterns if pattern]
 
@@ -556,7 +509,7 @@ class EclipPPFTTrainer:
         ]
         sidecar_params = [
             p
-            for module in (getattr(self, "binding_scorer", None), getattr(self, "signal_loss", None))
+            for module in (getattr(self, "signal_loss", None),)
             if module is not None
             for p in module.parameters()
             if p.requires_grad
@@ -592,8 +545,6 @@ class EclipPPFTTrainer:
                 self.global_step = self.step
             self.best_eval_loss = float(checkpoint.get("best_eval_loss", self.best_eval_loss))
             self.best_eval_step = int(checkpoint.get("best_eval_step", self.best_eval_step))
-        if "eclip_binding_scorer" in checkpoint:
-            self.binding_scorer.load_state_dict(checkpoint["eclip_binding_scorer"], strict=False)
         if "eclip_signal_loss" in checkpoint:
             self.signal_loss.load_state_dict(checkpoint["eclip_signal_loss"], strict=False)
         self.print(f"Loaded checkpoint {checkpoint_path} at step {self.step}")
@@ -604,7 +555,6 @@ class EclipPPFTTrainer:
         path = self.checkpoint_dir / (filename or f"{self.step}.pt")
         checkpoint = build_eclip_ppft_checkpoint(
             model=self.raw_model,
-            binding_scorer=self.binding_scorer,
             signal_loss=self.signal_loss,
             optimizer=self.optimizer,
             scheduler=self.scheduler,
@@ -636,70 +586,29 @@ class EclipPPFTTrainer:
         if DIST_WRAPPER.rank == 0:
             logging.info(msg)
 
-    def _sync_if_cuda(self) -> None:
-        if self.use_cuda:
-            torch.cuda.synchronize(self.device)
-
-    def _timer_start(self) -> float:
-        self._sync_if_cuda()
-        return time.perf_counter()
-
-    def _timer_elapsed(self, start: float) -> float:
-        self._sync_if_cuda()
-        return time.perf_counter() - start
-
-    @staticmethod
-    def _format_timing(metrics: dict[str, Any], namespace: str = "train") -> str:
-        parts = []
-        for key, label in [
-            (f"{namespace}/time/feature_cpu_s.avg", "feature_cpu"),
-            (f"{namespace}/time/feature_update_s.avg", "feature_update"),
-            (f"{namespace}/time/pairformer_s.avg", "pairformer"),
-            (f"{namespace}/time/diffusion_rollout_s.avg", "rollout"),
-            (f"{namespace}/time/binding_score_s.avg", "binding"),
-            (f"{namespace}/time/confidence_quality_s.avg", "confidence"),
-            (f"{namespace}/time/loss_s.avg", "loss"),
-            (f"{namespace}/time/backward_s.avg", "backward"),
-            (f"{namespace}/time/optimizer_s.avg", "optimizer"),
-        ]:
-            if key in metrics:
-                parts.append(f"{label}={metrics[key]:.3f}s")
-        return ", ".join(parts)
-
     def prepare_input_feature_dict(
         self, sample: dict[str, Any]
-    ) -> tuple[dict[str, torch.Tensor], dict[str, float]]:
-        timings: dict[str, float] = {}
-        start = self._timer_start()
+    ) -> dict[str, torch.Tensor]:
         feat_dict, _ = featurize_eclip_sample(sample)
-        timings["time/feature_cpu_s"] = self._timer_elapsed(start)
-
-        start = self._timer_start()
         feat_dict = to_device(feat_dict, self.device)
         feat_dict = self.model.relative_position_encoding.generate_relp(feat_dict)
         feat_dict = update_input_feature_dict(feat_dict)
-        timings["time/feature_update_s"] = self._timer_elapsed(start)
-        return feat_dict, timings
+        return feat_dict
 
     def rollout_and_score(
         self, feat_dict: dict[str, torch.Tensor]
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
-        torch.Tensor,
         dict[str, torch.Tensor],
-        dict[str, float],
     ]:
-        coords, p_bind, quality_loss, quality_metrics, timings = self.train_module(feat_dict)
-        return coords, p_bind, quality_loss, quality_metrics, timings
+        p_bind, quality_loss, quality_metrics = self.train_module(feat_dict)
+        return p_bind, quality_loss, quality_metrics
 
     def forward_sample(self, sample: dict[str, Any]) -> tuple[torch.Tensor, dict[str, Any]]:
-        forward_start = self._timer_start()
-        feat_dict, timings = self.prepare_input_feature_dict(sample)
-        _, p_bind, quality_loss, quality_metrics, rollout_timings = self.rollout_and_score(feat_dict)
-        timings.update(rollout_timings)
+        feat_dict = self.prepare_input_feature_dict(sample)
+        p_bind, quality_loss, quality_metrics = self.rollout_and_score(feat_dict)
 
-        start = self._timer_start()
         target, target_mask = align_signal_to_prediction(
             sample["signal_vector"],
             p_bind.shape[-1],
@@ -707,25 +616,15 @@ class EclipPPFTTrainer:
         )
         signal_loss, metrics = self.signal_loss(p_bind, target, target_mask)
         total_loss = self.eclip_cfg.signal_loss_weight * signal_loss + quality_loss
-        timings["time/loss_s"] = self._timer_elapsed(start)
-        timings["time/forward_total_s"] = self._timer_elapsed(forward_start)
 
         metrics = {f"eclip/{key}": value for key, value in metrics.items()}
         metrics.update({f"confidence/{key}": value for key, value in quality_metrics.items()})
-        metrics.update(timings)
         metrics["loss"] = total_loss.detach()
         p_bind_1d = p_bind.squeeze(0)
         binary_target = (target > 0.0).to(dtype=target.dtype)
-        point_target = normalize_log_signal(target.float().clamp_min(0.0))
-        metrics["pearson"] = masked_pearson(p_bind_1d, binary_target, target_mask)
-        metrics["signal_pearson"] = masked_pearson(p_bind_1d, target, target_mask)
-        metrics["point_pearson"] = masked_pearson(p_bind_1d, point_target, target_mask)
         metrics["topk_overlap"] = topk_overlap(p_bind.squeeze(0), target, target_mask)
         metrics["profile_auprc"] = binary_auprc(p_bind_1d, target, target_mask)
         metrics["profile_positive_rate"] = binary_target[target_mask].mean()
-        metrics["target_point_signal_std"] = masked_std(point_target, target_mask)
-        metrics["pred_signal_std"] = masked_std(p_bind_1d, target_mask)
-        metrics["target_signal_std"] = masked_std(target, target_mask)
         metrics["rna_tokens"] = torch.tensor(float(p_bind.shape[-1]), device=p_bind.device)
         return total_loss, metrics
 
@@ -741,7 +640,6 @@ class EclipPPFTTrainer:
         self.optimizer.zero_grad(set_to_none=True)
         loss_sum = None
         valid_count = 0
-        timing_sums: dict[str, float] = {}
         for sample in samples:
             try:
                 with enable_amp:
@@ -759,8 +657,6 @@ class EclipPPFTTrainer:
             for key, value in metrics.items():
                 if torch.is_tensor(value) or isinstance(value, (float, int)):
                     self.train_metrics.add(key, value.detach() if torch.is_tensor(value) else value, namespace="train")
-                if key.startswith("time/"):
-                    timing_sums[key] = timing_sums.get(key, 0.0) + float(value)
         if valid_count == 0:
             if self.use_ddp:
                 raise RuntimeError(f"Rank {DIST_WRAPPER.rank} has no valid samples at step {self.step}.")
@@ -773,29 +669,18 @@ class EclipPPFTTrainer:
             logging.warning("Skipping NaN/Inf loss at step %d", self.step)
             return {"skipped": 1.0}
 
-        start = self._timer_start()
         loss_mean.backward()
-        backward_s = self._timer_elapsed(start)
-        self.train_metrics.add("time/backward_s", backward_s, namespace="train")
 
-        start = self._timer_start()
         if self.configs.grad_clip_norm != 0.0:
             params = [p for group in self.optimizer.param_groups for p in group["params"]]
             torch.nn.utils.clip_grad_norm_(params, self.configs.grad_clip_norm)
         self.optimizer.step()
         self.scheduler.step()
-        optimizer_s = self._timer_elapsed(start)
-        self.train_metrics.add("time/optimizer_s", optimizer_s, namespace="train")
 
         step_metrics = {
             "loss": float(loss_mean.detach().cpu()),
             "valid": float(valid_count),
         }
-        step_metrics.update(
-            {key: value / valid_count for key, value in timing_sums.items()}
-        )
-        step_metrics["time/backward_s"] = backward_s
-        step_metrics["time/optimizer_s"] = optimizer_s
         return step_metrics
 
     def dump_sample_error(self, sample: dict[str, Any], error: str) -> None:
@@ -837,9 +722,6 @@ class EclipPPFTTrainer:
                         metric_wrapper.add(key, value.detach() if torch.is_tensor(value) else value, namespace="eval")
         metrics = metric_wrapper.calc()
         self.print(f"Step {self.step} eval metrics: {metrics}")
-        timing_msg = self._format_timing(metrics, namespace="eval")
-        if timing_msg:
-            self.print(f"Step {self.step} eval timing: {timing_msg}")
         if self.configs.use_wandb and DIST_WRAPPER.rank == 0:
             wandb.log(metrics, step=self.step)
         return metrics
@@ -863,16 +745,6 @@ class EclipPPFTTrainer:
                     }
                     if "loss" in step_metrics:
                         postfix["loss"] = f"{step_metrics['loss']:.4f}"
-                    for key, label in [
-                        ("time/feature_cpu_s", "feat"),
-                        ("time/pairformer_s", "pf"),
-                        ("time/diffusion_rollout_s", "roll"),
-                        ("time/binding_score_s", "bind"),
-                        ("time/confidence_quality_s", "conf"),
-                        ("time/backward_s", "bwd"),
-                    ]:
-                        if key in step_metrics:
-                            postfix[label] = f"{step_metrics[key]:.1f}s"
                     if "skipped" in step_metrics:
                         postfix["skipped"] = int(step_metrics["skipped"])
                     pbar.set_postfix(postfix)
@@ -880,13 +752,10 @@ class EclipPPFTTrainer:
                     if self.step % self.eclip_cfg.log_every_steps == 0:
                         metrics = self.train_metrics.calc()
                         self.print(f"Step {self.step} train metrics: {metrics}")
-                        timing_msg = self._format_timing(metrics, namespace="train")
-                        if timing_msg:
-                            self.print(f"Step {self.step} train timing: {timing_msg}")
                         if self.configs.use_wandb and DIST_WRAPPER.rank == 0:
                             metrics["train/lr"] = self.scheduler.get_last_lr()[0]
                             wandb.log(metrics, step=self.step)
-                    if self.eclip_cfg.eval_every_steps > 0 and self.step % self.eclip_cfg.eval_every_steps == 0:
+                    if self.configs.eval_interval > 0 and self.step % self.configs.eval_interval == 0:
                         eval_metrics = self.evaluate()
                         self.save_best_eval_checkpoint(eval_metrics)
                     if self.eclip_cfg.save_every_steps > 0 and self.step % self.eclip_cfg.save_every_steps == 0:
@@ -929,9 +798,9 @@ def main() -> None:
     )
     configs = build_configs(parse_sys_args())
     logging.info(
-        "eCLIP PPFT config: model=%s rollout_samples=1 rollout_steps=%s",
+        "eCLIP PPFT config: model=%s binding=distogram_contact confidence_rollout_steps=%s",
         configs.model_name,
-        configs.eclip_ppft.n_rollout_steps,
+        configs.eclip_ppft.confidence_rollout_steps,
     )
     trainer = EclipPPFTTrainer(configs)
     trainer.run()
