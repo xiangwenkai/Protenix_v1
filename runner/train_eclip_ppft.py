@@ -59,7 +59,6 @@ from protenix.model import sample_confidence
 from protenix.model.eclip_binding import (
     EclipSignalLoss,
     align_signal_to_prediction,
-    binary_auprc,
     compute_distogram_binding_score,
     topk_overlap,
 )
@@ -389,8 +388,10 @@ class EclipPPFTTrainer:
     def init_loss(self) -> None:
         self.signal_loss = EclipSignalLoss(
             profile_weight=self.eclip_cfg.signal_profile_weight,
-            positive_weight=self.eclip_cfg.signal_positive_weight,
-            point_weight=self.eclip_cfg.signal_point_weight,
+            min_height=self.eclip_cfg.signal_multinomial_min_height,
+            binary_threshold=self.eclip_cfg.signal_binary_threshold,
+            signal_clip_value=self.eclip_cfg.signal_clip_value,
+            max_total_count=self.eclip_cfg.signal_multinomial_max_total,
         ).to(self.device)
         if not self.eclip_cfg.train_sidecar:
             for param in self.signal_loss.parameters():
@@ -620,11 +621,7 @@ class EclipPPFTTrainer:
         metrics = {f"eclip/{key}": value for key, value in metrics.items()}
         metrics.update({f"confidence/{key}": value for key, value in quality_metrics.items()})
         metrics["loss"] = total_loss.detach()
-        p_bind_1d = p_bind.squeeze(0)
-        binary_target = (target > 0.0).to(dtype=target.dtype)
         metrics["topk_overlap"] = topk_overlap(p_bind.squeeze(0), target, target_mask)
-        metrics["profile_auprc"] = binary_auprc(p_bind_1d, target, target_mask)
-        metrics["profile_positive_rate"] = binary_target[target_mask].mean()
         metrics["rna_tokens"] = torch.tensor(float(p_bind.shape[-1]), device=p_bind.device)
         return total_loss, metrics
 

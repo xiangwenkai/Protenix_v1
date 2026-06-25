@@ -30,7 +30,6 @@ from protenix.config.config import parse_configs, parse_sys_args
 from protenix.model import sample_confidence
 from protenix.model.eclip_binding import (
     EclipSignalLoss,
-    binary_auprc,
     compute_distogram_binding_score,
     get_protein_token_indices,
     get_rna_token_indices,
@@ -63,7 +62,10 @@ class RNASignalSFTTrainer(AF3Trainer):
         cfg = self.configs.rna_signal_sft
         self.signal_loss = EclipSignalLoss(
             profile_weight=cfg.signal_profile_weight,
-            point_weight=cfg.signal_point_weight,
+            min_height=cfg.signal_multinomial_min_height,
+            binary_threshold=cfg.signal_binary_threshold,
+            signal_clip_value=cfg.signal_clip_value,
+            max_total_count=cfg.signal_multinomial_max_total,
         ).to(self.device)
         for param in self.signal_loss.parameters():
             param.requires_grad_(False)
@@ -149,7 +151,6 @@ class RNASignalSFTTrainer(AF3Trainer):
 
         signal_loss, metrics = self.signal_loss(p_bind, target, target_mask)
         p_bind_1d = p_bind.squeeze(0) if p_bind.ndim > 1 and p_bind.shape[0] == 1 else p_bind
-        metrics["profile_auprc"] = binary_auprc(p_bind_1d, target, target_mask)
         metrics["topk_overlap"] = topk_overlap(p_bind_1d, target, target_mask)
         metrics["valid_tokens"] = target_mask.float().sum()
         metrics["skipped"] = torch.tensor(0.0, device=p_bind.device)

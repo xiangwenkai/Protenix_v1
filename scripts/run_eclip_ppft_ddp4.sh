@@ -62,8 +62,10 @@ torchrun --standalone --nproc_per_node=4 runner/train_eclip_ppft.py \
   --eclip_ppft.eval_max_steps 32 \
   --eclip_ppft.distogram_contact_threshold 8.0 \
   --eclip_ppft.signal_profile_weight 1.0 \
-  --eclip_ppft.signal_positive_weight 1.0 \
-  --eclip_ppft.signal_point_weight 0.2 \
+  --eclip_ppft.signal_multinomial_min_height 3.0 \
+  --eclip_ppft.signal_binary_threshold 2.0 \
+  --eclip_ppft.signal_clip_value 100.0 \
+  --eclip_ppft.signal_multinomial_max_total 100.0 \
   --eclip_ppft.confidence_quality_weight 0.4 \
   --eclip_ppft.confidence_quality_target 0.8 \
   --eclip_ppft.confidence_rollout_steps 20 \

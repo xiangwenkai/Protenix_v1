@@ -30,6 +30,198 @@
 | ProtScan, arXiv 2024 | transcriptome-wide nucleotide profile/peaks | RNA sequence k-mer/string-kernel features | binding site 距离标签；从 CLIP peak/binding regions 派生 | 96 RBPs，K562/HepG2，两 replicate；benchmark 用 11 RBPs、34 comparisons | 约 1% human genome genes 测试 | ridge regression squared loss + consensus voting + smoothing | AUROC、auPRC | average AUROC 0.8；average auPRC 0.008，positive ratio 约 1:2500 | 中：单碱基 profile，但不是连续 eCLIP signal |
 | DeepRiPe / DeepBind / PrismNet / GraphProt | 主要是区域/窗口分类 | RNA sequence，部分加入结构/annotation | bound/unbound region labels | ENCODE/eCLIP/CLIP/RNAcompete 等 | 依模型而异 | BCE/SVM/classification loss | AUC/AUPRC | RBPNet 文献中 DeepRiPe 伪单碱基 baseline：auROC 0.74，AP 0.012 | 低到中：不是天然 residue-level profile |
 
+## 当前使用的 parnet/ENCODE eCLIP 数据说明
+
+你当前用于 Protenix eCLIP signal SFT 的数据来自 `parnet` 发布的 ENCODE eCLIP 多任务数据集，而不是 iDeepB 或 RBPNet 原始 benchmark 的逐模型数据文件。它与 iDeepB 在数据来源上非常接近：都来自 ENCODE eCLIP，覆盖约 150 个 RBP，并主要包含 K562 和 HepG2 两个细胞系；但样本组织方式不同。
+
+`parnet` README 中说明其主训练集是 HuggingFace Dataset format，包含 223 条 ENCODE eCLIP tracks。本地数据位于：
+
+```text
+/inspire/ssd/project/sais-bio/public/xiangwenkai/GITHUB/parnet/encode.filtered.hfds
+```
+
+原始 HFDS 的一个样本不是一个 `(protein_sequence, RNA_sequence, label)` 蛋白-RNA 配对，而是一个 RNA genomic window 及其多任务信号矩阵：
+
+```text
+inputs.sequence    sparse one-hot RNA sequence，通常长度 600
+outputs.eCLIP      sparse [223, 600] eCLIP signal matrix
+outputs.control    sparse [223, 600] SMInput/control signal matrix
+meta.name          genomic interval，例如 chr14:100374289-100374889:-
+```
+
+这里的 `223` 是 task 数。每个 task 是一个固定 ENCODE 实验轨道，由 `protein_symbol + cell_line` 定义，而不是动态输入的蛋白序列。本地 task map 为：
+
+```text
+/inspire/ssd/project/sais-bio/public/xiangwenkai/GITHUB/parnet/parnet/assets/ENCODE.idx2symbol-cell.tsv
+```
+
+本地统计结果：
+
+| 项目 | 数量 |
+|---|---:|
+| eCLIP task tracks | 223 |
+| unique protein symbols | 150 |
+| K562 tracks | 120 |
+| HepG2 tracks | 103 |
+| train RNA windows | 512,946 |
+| validation RNA windows | 116,542 |
+| test RNA windows | 70,626 |
+
+因此，`parnet` 原始训练范式是 **RNA sequence -> 223 个 task 的 per-base eCLIP/control profile**。protein identity 在原模型中是固定输出 head 的 task index，不是输入 protein sequence。
+
+为了给 Protenix 使用，本地用以下脚本把 HFDS 展开成 task-level parquet rows：
+
+```text
+/inspire/ssd/project/sais-bio/public/xiangwenkai/GITHUB/parnet/parnet/bin/export_hfds.py
+/inspire/ssd/project/sais-bio/public/xiangwenkai/GITHUB/parnet/export_all_hfds.sh
+```
+
+展开后的每一行对应一个 `(protein_symbol, cell_line, RNA window)`：
+
+```text
+rna_seq
+protein_symbol
+cell_line
+signal_vector
+```
+
+也就是说，一个 600 nt RNA window 会按 223 个 task 展开，最多变成 223 条 task-level 样本：
+
+```text
+512,946 train RNA windows x 223 tasks = 114,386,958 train task-level rows
+```
+
+这解释了为什么你看到的数据可以表述为“约 150 个蛋白、2 个细胞系、50 多万 RNA 序列、总计约一亿多条 protein/RNA signal rows”。这里的一亿多条不是独立测序得到的一亿多条 RNA，而是 RNA windows 乘以 ENCODE task tracks 后的展开结果。
+
+当前主要训练路径使用的是进一步过滤后的高质量正样本：
+
+```text
+/inspire/ssd/project/sais-bio/public/xiangwenkai/GITHUB/parnet/data_process/high_quality_positive
+```
+
+该目录由 `parnet/data/eclip_quality_filter.py` 从全部 task-level rows 过滤得到。当前 summary 显示：
+
+| Split | 输入 task-level rows | 保留 high-quality positive rows |
+|---|---:|---:|
+| train | 114,386,958 | 969,307 |
+| validation | 25,988,866 | 221,572 |
+| test | 15,749,598 | 113,936 |
+
+过滤逻辑按 `protein_symbol` 分组校准阈值，筛选有足够总信号、足够 peak 信号、且信号在局部窗口内较集中的 profile。当前 `high_quality_positive` 是 positive-only subset，`include_negatives = false`；它不是 `parnet` 原始完整训练分布，也不是全量 eCLIP 负样本集。
+
+### signal 数值来源与含义
+
+`signal_vector` 中的数值是每个 RNA 位置上的 eCLIP count-like signal。它不是模型预测概率，也不是 `log1p` 后的归一化标签。
+
+从本地代码能确认的处理链条是：
+
+1. `parnet/data/bioIO.py` 中的设计从 stranded bigWig 读取每个 genomic interval 上的逐碱基值。
+2. 这些逐碱基值被堆叠成 `outputs.eCLIP` 和 `outputs.control`，形状为 `[num_tasks, sequence_length]`。
+3. `parnet/data/datasets.py` 读取 HFDS 时只是把 sparse tensor 转 dense，不做 log transform、softmax 或概率归一化。
+4. `parnet/bin/export_hfds.py` 展开 HFDS 时只是把某个 task 的 dense eCLIP vector 写成 `signal_vector`，同样不做归一化。
+5. `eclip_quality_filter.py` 额外生成的 `profile_label` 才是从 `signal_vector` 派生的训练标签：先对 signal 做 `log1p`，再在单条 RNA 内归一化。
+
+因此，你在 parquet 里看到 `signal_vector` 多数是整数，是因为上游 eCLIP bigWig 轨道本身保存的是每个碱基位置的 read/crosslink count 或 count-like coverage。HFDS 虽然把这些值存成 `float32`，parquet 中也可能显示为 double/list float，但数值语义仍然是观测到的 eCLIP 计数强度。简单说：
+
+```text
+signal_vector[i] = 这个 ENCODE eCLIP task 在该 RNA window 第 i 个碱基上的观测 read/crosslink count-like signal
+```
+
+它的几个派生量含义如下：
+
+| 字段 | 计算方式 | 含义 |
+|---|---|---|
+| `signal_total` | `sum(signal_vector)` | 该 RNA window 对该 RBP/cell task 的总 eCLIP 信号 |
+| `signal_peak` | `max(signal_vector)` | 单碱基最高信号 |
+| `signal_nonzero_fraction` | `mean(signal_vector > 0)` | 有观测信号的位置比例 |
+| `signal_topk_ratio` | `sum(top-k signal) / sum(signal)` | 信号是否集中在少数位置 |
+| `signal_window_var_norm` | 先按 10 nt window 求和，再计算归一化方差 | 信号是否局部集中 |
+| `profile_label` | `log1p(signal_vector) / sum(log1p(signal_vector))` | 单条 RNA 内的归一化 profile 标签 |
+
+这也意味着当前 Protenix 训练里的二值标签：
+
+```text
+target_binary = signal_vector > 0
+```
+
+本质上是在判断“该位置是否有非零 eCLIP 观测信号”；连续 point loss 使用的 per-sample normalized `log1p(signal)` 则是在学习“非零信号在 RNA window 内的相对强弱分布”。如果要和 iDeepB 的指标更接近，可以额外报告 `signal >= 2` 的 strict label，因为 iDeepB 的 signal AUC/AP 使用了 crosslink count `>= 2` 作为 positive base。
+
+需要注意一个限制：当前本地 `export_hfds.py` 导出的字段没有包含 `control_signal`，虽然 HFDS 中存在 `outputs.control`。因此当前 `high_quality_positive` 过滤 summary 中 `control_column = null`，没有做 control-adjusted signal，例如 `log1p(eCLIP) - log1p(control)`。如果后续要更严格对齐 iDeepB/RBPNet 的 bias-correction 思路，应考虑重新导出 control track 或在过滤/训练时引入 control-adjusted label。
+
+#### signal来源解释
+  signal_vector 整数值来源解释：它是从 eCLIP bigWig 轨道读取的 per-base read/crosslink count-like signal，不是概率，也不是 log/归一化后的标签。
+  signal = 0      没有观测到 eCLIP 支持
+  signal = 1      极弱/低置信信号
+  signal >= 2     更像 iDeepB 里常用的 positive base 阈值
+  signal peak 高 + 局部集中 + total 高   更可信的 binding profile
+  所以训练/评估时建议保留两套 label：
+  loose positive:  signal > 0
+  strict positive: signal >= 2
+#### parnet训练预测以及计算指标时，有进行这种强弱过滤吗？计算AP指标，是否是把信号转为0，1变量后计算的？
+  1. parnet 训练时有强弱过滤，但不是逐碱基过滤
+  本地 parnet 的训练 loss 是 MultinomialNLLLoss，配置里：
+  parnet.losses.MultinomialNLLLoss.min_height = 3
+  代码位置：/inspire/ssd/project/sais-bio/public/xiangwenkai/GITHUB/parnet/parnet/losses.py:21
+  核心逻辑是：
+  min_height_map = counts.max(dim=-1).values >= self.min_height
+  也就是说，对每个 sample x task 的 600 nt signal profile，如果这个 profile 里 最大 signal < 3，这个 task/profile 的 loss 会被 mask 掉，不参与 multinomial NLL。
+  但它不是说：
+  signal = 1 的位置被删掉
+  而是：
+  如果一个 profile 里至少有某个位置 signal >= 3，
+  那么整个 count profile 参与训练，里面 signal=1 的位置仍然保留。
+  所以 parnet 训练不是逐碱基把弱信号过滤掉，而是按整条 profile 判断这个 task/window 是否有足够强的 signal。
+
+  2. parnet 训练 loss 不把 signal 转成 0/1
+  parnet 的 loss 不是 BCE。它用的是 multinomial NLL：
+  torch.distributions.Multinomial(logits=logits).log_prob(counts)
+  这里的 counts 是原始 count profile，例如：
+  [0, 0, 1, 0, 3, 5, 0, ...]
+  模型预测的是这个 window 内 count mass 的位置分布。训练时不会先变成：
+  [0, 0, 1, 0, 1, 1, 0, ...]
+  所以 parnet 训练更像是在学：
+  信号主要集中在哪些碱基，以及相对强弱如何分布
+  而不是单纯学每个位置是否 positive。
+
+  3. parnet 本地训练指标里没有 AP
+  本地配置里 metric 是：
+  train.metrics = {
+      'pcc': PearsonCorrCoeff,
+      'filtered_pcc': FilteredPearsonCorrCoeff
+  }
+  代码位置：/inspire/ssd/project/sais-bio/public/xiangwenkai/GITHUB/parnet/configs/RBPNet-11M.config.gin:9
+  也就是说，当前 parnet 训练代码主要看 Pearson/filtered Pearson，没有看到内置 AP/AUPRC 训练指标。
+
+  4. 如果计算 AP，一定需要把真实 signal 转成 0/1
+
+  AP/AUPRC 是二分类 ranking 指标，所以 target 必须是 binary label。常见做法是：
+  loose:  positive = signal > 0
+  strict: positive = signal >= 2
+  peak:   positive = ENCODE/PureCLIP peak site
+
+  预测值不需要二值化，仍然用连续 score，例如：
+  score = predicted binding probability / predicted profile probability / p_bind
+  然后计算：
+  average_precision_score(binary_target, score)
+  所以回答你的问题：
+  parnet 训练 loss：不转 0/1，用原始 count profile，并按 max signal >= 3 过滤整条 profile。
+  parnet 本地 metric：主要是 Pearson，不是 AP。
+  文献里的 AP/iDeepB 的 signal AP：是把真实 signal 转成 0/1 后算的，常用 threshold 是 count >= 2。
+  对你当前任务，我建议同时报：
+  auprc_loose:  target = signal > 0
+  auprc_strict: target = signal >= 2
+  signal >= 2 更能排除很多只有 1 条 read 支持的弱噪声位置。
+
+  signal_binary_threshold设成 2 的原因是对齐 iDeepB/RBPNet 文献里常见的 base-level signal positive 定义：positive base = crosslink count >= 2
+
+#### 极值应对
+   单个signal截断为100，总的signal做total count cap：
+      total = signal.sum()
+      if total > max_total:
+            signal_for_loss = signal / total * max_total
+      else:
+            signal_for_loss = signal
+
 ## 1. RBPNet：最直接的 sequence-to-crosslink-profile baseline
 
 **论文**：Horlacher et al., *Towards in silico CLIP-seq: predicting protein-RNA interaction profiles from sequence*, Genome Biology, 2023.  
@@ -476,4 +668,3 @@ topk_overlap
 6. ENCODE RBP/eCLIP reference  
    - Van Nostrand et al., *A large-scale binding and functional map of human RNA-binding proteins*, Nature, 2020.  
    - `https://www.nature.com/articles/s41586-020-2077-3`
-

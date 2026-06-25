@@ -25,7 +25,6 @@ from typing import Any, Optional
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 def _heavy_atom_mask(feat_dict: dict[str, torch.Tensor]) -> torch.Tensor:
@@ -190,21 +189,35 @@ def normalize_log_signal(signal: torch.Tensor, eps: float = 1e-8) -> torch.Tenso
 
 
 class EclipSignalLoss(nn.Module):
-    """Binary eCLIP signal loss for one rollout structure."""
+    """Multinomial count-profile eCLIP signal loss.
+
+    This follows the RBPNet/parnet objective shape: the target is the original
+    per-position count profile, while model scores are normalized across the
+    RNA positions and used as multinomial logits. A profile contributes to the
+    loss only when its maximum count reaches ``min_height``.
+    """
 
     def __init__(
         self,
         *,
         profile_weight: float = 1.0,
-        positive_weight: float = 1.0,
-        point_weight: float = 0.2,
+        min_height: float = 3.0,
+        binary_threshold: float = 2.0,
+        signal_clip_value: float = 100.0,
+        max_total_count: float = 100.0,
         eps: float = 1e-8,
+        positive_weight: float | None = None,
+        point_weight: float | None = None,
     ) -> None:
         super().__init__()
         self.profile_weight = profile_weight
-        self.positive_weight = positive_weight
-        self.point_weight = point_weight
+        self.min_height = min_height
+        self.binary_threshold = binary_threshold
+        self.signal_clip_value = signal_clip_value
+        self.max_total_count = max_total_count
         self.eps = eps
+        # Kept only so older sidecar checkpoints/config calls do not break.
+        _ = positive_weight, point_weight
 
     def forward(
         self,
@@ -221,42 +234,82 @@ class EclipSignalLoss(nn.Module):
         else:
             target_mask = target_mask.to(device=p_bind.device, dtype=torch.bool)
 
-        valid_p = p_bind[target_mask].clamp(self.eps, 1.0 - self.eps)
+        valid_p = p_bind[target_mask].clamp_min(self.eps)
         valid_signal = target_signal[target_mask].clamp_min(0.0)
         if valid_p.numel() == 0:
             zero = p_bind.sum() * 0.0
             return zero, {"loss": zero.detach()}
 
-        target_bind = (valid_signal > 0.0).to(dtype=valid_p.dtype)
-        profile_weights = torch.ones_like(valid_p)
-        profile_weights = torch.where(
-            target_bind > 0.0,
-            profile_weights * float(self.positive_weight),
-            profile_weights,
-        )
-        profile_loss_per_token = -(
-            target_bind * valid_p.clamp_min(self.eps).log()
-            + (1.0 - target_bind) * (1.0 - valid_p).clamp_min(self.eps).log()
-        )
-        profile_loss = (
-            profile_loss_per_token * profile_weights
-        ).sum() / profile_weights.sum().clamp_min(self.eps)
+        raw_signal = valid_signal
+        loss_signal = valid_signal
+        if self.signal_clip_value is not None and float(self.signal_clip_value) > 0.0:
+            loss_signal = loss_signal.clamp_max(float(self.signal_clip_value))
+        clipped_total = loss_signal.sum()
+        if self.max_total_count is not None and float(self.max_total_count) > 0.0:
+            max_total = torch.as_tensor(
+                float(self.max_total_count),
+                dtype=loss_signal.dtype,
+                device=loss_signal.device,
+            )
+            scale = torch.minimum(
+                torch.ones((), dtype=loss_signal.dtype, device=loss_signal.device),
+                max_total / clipped_total.clamp_min(self.eps),
+            )
+            loss_signal = loss_signal * scale
 
-        target_point_signal = normalize_log_signal(valid_signal, eps=self.eps)
-        point_loss = F.smooth_l1_loss(valid_p, target_point_signal, reduction="mean")
+        profile_pass = raw_signal.max() >= float(self.min_height)
+        profile_pass_bool = bool(profile_pass.detach().item())
+        pred_logits = valid_p.log()
+        pred_profile = torch.softmax(pred_logits.float(), dim=-1)
+        if profile_pass_bool:
+            profile_loss = -torch.distributions.Multinomial(
+                logits=pred_logits.float(),
+                validate_args=False,
+            ).log_prob(loss_signal.float())
+        else:
+            profile_loss = pred_logits.sum() * 0.0
+
         weighted_profile_loss = self.profile_weight * profile_loss
-        weighted_point_loss = self.point_weight * point_loss
-        loss = weighted_profile_loss + weighted_point_loss
+        loss = weighted_profile_loss
+        target_bind = (raw_signal >= float(self.binary_threshold)).to(dtype=valid_p.dtype)
         metrics = {
             "loss": loss.detach(),
-            "profile_bce": profile_loss.detach(),
-            "weighted_profile_bce": weighted_profile_loss.detach(),
-            "point_loss": point_loss.detach(),
-            "weighted_point_loss": weighted_point_loss.detach(),
+            "profile_multinomial_nll": profile_loss.detach(),
+            "weighted_profile_multinomial_nll": weighted_profile_loss.detach(),
+            "profile_min_height_pass": torch.as_tensor(
+                float(profile_pass_bool),
+                device=p_bind.device,
+                dtype=torch.float32,
+            ),
+            "profile_pcc": masked_pearson(
+                pred_profile,
+                valid_signal,
+                torch.ones_like(valid_signal, dtype=torch.bool),
+                eps=self.eps,
+            ),
+            "profile_auprc": binary_auprc(
+                valid_p,
+                valid_signal,
+                torch.ones_like(valid_signal, dtype=torch.bool),
+                threshold=float(self.binary_threshold),
+            ),
             "p_bind_mean": valid_p.detach().mean(),
-            "target_signal_sum": valid_signal.detach().sum(),
+            "target_signal_sum": raw_signal.detach().sum(),
+            "loss_signal_sum": loss_signal.detach().sum(),
+            "loss_signal_clip_value": torch.as_tensor(
+                float(self.signal_clip_value),
+                device=p_bind.device,
+                dtype=torch.float32,
+            ),
+            "loss_signal_max_total": torch.as_tensor(
+                float(self.max_total_count),
+                device=p_bind.device,
+                dtype=torch.float32,
+            ),
             "target_positive_sum": target_bind.detach().sum(),
             "target_positive_rate": target_bind.detach().mean(),
+            "target_signal_peak": raw_signal.detach().max(),
+            "loss_signal_peak": loss_signal.detach().max(),
         }
         return loss, metrics
 
@@ -345,11 +398,21 @@ def topk_overlap(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor, k
 
 
 @torch.no_grad()
-def binary_auprc(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+def binary_auprc(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    threshold: float = 0.0,
+) -> torch.Tensor:
     """Average precision/AUPRC for binary signal targets."""
 
     pred = pred.float()[mask]
-    target = (target.float()[mask] > 0.0).float()
+    valid_target = target.float()[mask]
+    if threshold <= 0.0:
+        target = (valid_target > 0.0).float()
+    else:
+        target = (valid_target >= float(threshold)).float()
     if pred.numel() == 0:
         return torch.tensor(0.0, device=mask.device)
     positive_count = target.sum()
