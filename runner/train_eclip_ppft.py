@@ -225,7 +225,7 @@ class EclipPPFTForwardModule(nn.Module):
             p_lm=cache["p_lm/c_l"][0],
             c_l=cache["p_lm/c_l"][1],
             noise_schedule=noise_schedule,
-            N_sample=1,
+            N_sample=int(self.eclip_cfg.n_rollout_samples),
             record_grad_steps=set(self.eclip_cfg.record_grad_steps),
             detach_unrecorded_steps=self.eclip_cfg.detach_unrecorded_steps,
             gamma0=self.configs.sample_diffusion.gamma0,
@@ -239,7 +239,11 @@ class EclipPPFTForwardModule(nn.Module):
         timings["time/diffusion_rollout_s"] = self._timer_elapsed(start)
 
         start = self._timer_start()
-        p_bind, _ = self.binding_scorer(coords.float(), feat_dict)
+        p_bind_samples, _ = self.binding_scorer(coords.float(), feat_dict)
+        if p_bind_samples.ndim > 1:
+            p_bind = p_bind_samples.mean(dim=-2, keepdim=True)
+        else:
+            p_bind = p_bind_samples
         timings["time/binding_score_s"] = self._timer_elapsed(start)
 
         start = self._timer_start()
@@ -929,8 +933,9 @@ def main() -> None:
     )
     configs = build_configs(parse_sys_args())
     logging.info(
-        "eCLIP PPFT config: model=%s rollout_samples=1 rollout_steps=%s",
+        "eCLIP PPFT config: model=%s rollout_samples=%s rollout_steps=%s",
         configs.model_name,
+        configs.eclip_ppft.n_rollout_samples,
         configs.eclip_ppft.n_rollout_steps,
     )
     trainer = EclipPPFTTrainer(configs)

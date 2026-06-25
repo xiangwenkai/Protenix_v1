@@ -29,6 +29,7 @@ torchrun --standalone --nproc_per_node=4 runner/train_eclip_ppft.py \
   --eclip_ppft.data_dir /inspire/ssd/project/sais-bio/public/xiangwenkai/GITHUB/parnet/data_process/high_quality_positive \
   --eclip_ppft.num_workers 16 \
   --eclip_ppft.max_protein_length 600 \
+  --eclip_ppft.n_rollout_samples 1 \
   --eclip_ppft.n_rollout_steps 7 \
   --eclip_ppft.record_grad_steps 3,4,5 \
   --eclip_ppft.save_every_steps 500 \

@@ -46,15 +46,15 @@ def sample_diffusion_ppft(
     attn_chunk_size: Optional[int] = None,
     enable_efficient_fusion: bool = False,
 ) -> torch.Tensor:
-    """Single-structure PPFT rollout with optional gradient-recorded steps.
+    """PPFT rollout with optional gradient-recorded denoising steps.
 
     Step indices are 1-based over denoising steps. The last step is always
     recorded with gradients to keep the property loss connected to model
-    parameters. eCLIP PPFT requires ``N_sample == 1``.
+    parameters.
     """
 
-    if N_sample != 1:
-        raise ValueError("eCLIP PPFT rollout must use N_sample=1.")
+    if N_sample < 1:
+        raise ValueError(f"N_sample must be >= 1, got {N_sample}.")
     num_steps = int(noise_schedule.numel()) - 1
     if num_steps <= 0:
         raise ValueError("noise_schedule must contain at least two time points.")
@@ -71,7 +71,7 @@ def sample_diffusion_ppft(
     dtype = s_inputs.dtype
 
     x_l = noise_schedule[0] * torch.randn(
-        size=(*batch_shape, 1, N_atom, 3), device=device, dtype=dtype
+        size=(*batch_shape, N_sample, N_atom, 3), device=device, dtype=dtype
     )
 
     for step_idx, (c_tau_last, c_tau) in enumerate(
@@ -93,7 +93,7 @@ def sample_diffusion_ppft(
             )
             t_hat = (
                 t_hat_scalar.reshape((1,) * (len(batch_shape) + 1))
-                .expand(*batch_shape, 1)
+                .expand(*batch_shape, N_sample)
                 .to(dtype)
             )
             x_denoised = denoise_net(
