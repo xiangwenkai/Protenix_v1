@@ -60,10 +60,7 @@ from protenix.model.eclip_binding import (
     EclipBindingScorer,
     EclipSignalLoss,
     align_signal_to_prediction,
-    binary_auprc,
-    masked_pearson,
     masked_std,
-    normalize_log_signal,
     topk_overlap,
 )
 from protenix.model.generator_ppft import sample_diffusion_ppft
@@ -426,8 +423,10 @@ class EclipPPFTTrainer:
         ).to(self.device)
         self.signal_loss = EclipSignalLoss(
             profile_weight=self.eclip_cfg.signal_profile_weight,
-            positive_weight=self.eclip_cfg.signal_positive_weight,
-            point_weight=self.eclip_cfg.signal_point_weight,
+            min_height=self.eclip_cfg.signal_multinomial_min_height,
+            binary_threshold=self.eclip_cfg.signal_binary_threshold,
+            signal_clip_value=self.eclip_cfg.signal_clip_value,
+            max_total_count=self.eclip_cfg.signal_multinomial_max_total,
         ).to(self.device)
         if not self.eclip_cfg.train_sidecar:
             for param in self.binding_scorer.parameters():
@@ -719,15 +718,7 @@ class EclipPPFTTrainer:
         metrics.update(timings)
         metrics["loss"] = total_loss.detach()
         p_bind_1d = p_bind.squeeze(0)
-        binary_target = (target > 0.0).to(dtype=target.dtype)
-        point_target = normalize_log_signal(target.float().clamp_min(0.0))
-        metrics["pearson"] = masked_pearson(p_bind_1d, binary_target, target_mask)
-        metrics["signal_pearson"] = masked_pearson(p_bind_1d, target, target_mask)
-        metrics["point_pearson"] = masked_pearson(p_bind_1d, point_target, target_mask)
         metrics["topk_overlap"] = topk_overlap(p_bind.squeeze(0), target, target_mask)
-        metrics["profile_auprc"] = binary_auprc(p_bind_1d, target, target_mask)
-        metrics["profile_positive_rate"] = binary_target[target_mask].mean()
-        metrics["target_point_signal_std"] = masked_std(point_target, target_mask)
         metrics["pred_signal_std"] = masked_std(p_bind_1d, target_mask)
         metrics["target_signal_std"] = masked_std(target, target_mask)
         metrics["rna_tokens"] = torch.tensor(float(p_bind.shape[-1]), device=p_bind.device)

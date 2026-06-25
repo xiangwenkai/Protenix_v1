@@ -32,5 +32,10 @@ torchrun --standalone --nproc_per_node=4 runner/train_eclip_ppft.py \
   --eclip_ppft.n_rollout_samples 1 \
   --eclip_ppft.n_rollout_steps 7 \
   --eclip_ppft.record_grad_steps 3,4,5 \
+  --eclip_ppft.signal_profile_weight 1.0 \
+  --eclip_ppft.signal_multinomial_min_height 3.0 \
+  --eclip_ppft.signal_binary_threshold 2.0 \
+  --eclip_ppft.signal_clip_value 100.0 \
+  --eclip_ppft.signal_multinomial_max_total 100.0 \
   --eclip_ppft.save_every_steps 500 \
   --eclip_ppft.eval_every_steps 500
