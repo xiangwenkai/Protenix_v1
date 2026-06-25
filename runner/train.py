@@ -605,8 +605,11 @@ class AF3Trainer(object):
 
         if self.configs.dtype in ["bf16", "fp32"]:
             if is_loss_nan_check(loss):
-                self.print(f"Skip iteration with NaN loss at step {self.step}")
-                loss = torch.tensor(0.0, device=loss.device, requires_grad=True)
+                # self.print(f"Skip iteration with NaN loss at step {self.step}")
+                # loss = torch.tensor(0.0, device=loss.device, requires_grad=True)
+                self.print(f"Skip iteration with NaN/Inf loss at step {self.step}")
+                self.optimizer.zero_grad(set_to_none=True)
+                return
         scaler.scale(loss / self.iters_to_accumulate).backward()
 
         # Global training step used for accumulation logic

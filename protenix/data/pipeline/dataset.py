@@ -763,6 +763,20 @@ class BaseSingleDataset(Dataset):
         )
         features_dict.update(feat.get_all_input_features())
         labels_dict = feat.get_labels()
+        if len(token_array) > 0 and "rna_binding_signal" in token_array[0]._annot:
+            labels_dict["rna_binding_signal"] = torch.tensor(
+                token_array.get_annotation("rna_binding_signal"),
+                dtype=torch.float32,
+            )
+            labels_dict["rna_binding_signal_mask"] = torch.tensor(
+                token_array.get_annotation("rna_binding_signal_mask"),
+                dtype=torch.bool,
+            )
+            if "rna_binding_resolved_mask" in token_array[0]._annot:
+                labels_dict["rna_binding_resolved_mask"] = torch.tensor(
+                    token_array.get_annotation("rna_binding_resolved_mask"),
+                    dtype=torch.bool,
+                )
 
         # Permutation list for atom permutation
         features_dict["atom_perm_list"] = feat.get_atom_permutation_list()
@@ -902,6 +916,8 @@ def get_template_featurizer(
     if "template" in (dataset_config := configs["data"][dataset_name]):
         for k, v in dataset_config["template"].items():
             template_args[k] = v
+    if not template_args.get("enable_prot_template", False):
+        return None
     template_args.update(
         {
             "stage": stage,

@@ -42,7 +42,9 @@ def compile(
     except Exception:
         _supported = {"70", "80", "86", "90"}  # safe defaults
 
-    _wanted = [("70", "70"), ("80", "80"), ("86", "86"), ("89", "89"), ("90", "90"), ("100", "100")]
+    # Cap architectures at what the installed PyTorch supports. PyTorch 2.4 / CUDA 12.1
+    # does not recognize sm_100/sm_120, so including them makes jit compilation fail.
+    _wanted = [("70", "70"), ("80", "80"), ("86", "86"), ("89", "89"), ("90", "90")]
     gencode_flags = []
     for compute, sm in _wanted:
         if compute in _supported:
