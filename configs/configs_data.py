@@ -19,7 +19,11 @@ from pathlib import Path
 
 from protenix.config.extend_types import GlobalConfigValue, ListValue
 
-PROTENIX_ROOT_DIR = os.environ.get("PROTENIX_ROOT_DIR", str(Path.home()))
+# PROTENIX_ROOT_DIR = os.environ.get("PROTENIX_ROOT_DIR", str(Path.home()))
+PROTENIX_ROOT_DIR = os.environ.get("PROTENIX_ROOT_DIR", "/inspire/ssd/project/sais-bio/public/Protein/data/AI_Models/protenix_v1_dataset/")
+rna_msa_dir = "/inspire/ssd/project/sais-bio/public/xiangwenkai/GITHUB/Protenix/rna_data"
+custom_rna_dir = "/inspire/ssd/project/sais-bio/public/xiangwenkai/GITHUB/Protenix_v1/data/"
+RNA_DATA_ROOT_DIR = os.environ.get("PROTENIX_DATA_ROOT_DIR", "/inspire/ssd/project/sais-bio/public/xiangwenkai/GITHUB/Protenix_v1/data")
 
 default_test_configs = {
     "sampler_configs": {
@@ -130,21 +134,77 @@ data_configs = {
     "epoch_size": 10000,
     "train_ref_pos_augment": True,
     "test_ref_pos_augment": True,
-    "train_sets": ListValue(["weightedPDB_before2109_wopb_nometalc_0925"]),
+    "train_sets": ListValue(["train_rna_before202606"]),
     "train_sampler": {
         "train_sample_weights": ListValue([1.0]),
         "sampler_type": "weighted",
     },
-    "test_sets": ListValue(["recentPDB_1536_sample384_0925"]),
-    "weightedPDB_before2109_wopb_nometalc_0925": {
+    "test_sets": ListValue(["test_rna_before202606"]),
+    # "weightedPDB_before2109_wopb_nometalc_0925": {
+    #     "base_info": {
+    #         "mmcif_dir": os.path.join(PROTENIX_ROOT_DIR, "mmcif"),
+    #         "bioassembly_dict_dir": os.path.join(
+    #             PROTENIX_ROOT_DIR, "mmcif_bioassembly"
+    #         ),
+    #         "indices_fpath": os.path.join(
+    #             PROTENIX_ROOT_DIR,
+    #             "indices/weightedPDB_indices_before_2021-09-30_wo_posebusters_resolution_below_9.csv.gz",
+    #         ),
+    #         "pdb_list": "",
+    #         "random_sample_if_failed": True,
+    #         "max_n_token": -1,  # can be used for removing data with too many tokens.
+    #         "use_reference_chains_only": False,
+    #         "exclusion": {  # do not sample the data based on ions.
+    #             "mol_1_type": ListValue(["ions"]),
+    #             "mol_2_type": ListValue(["ions"]),
+    #         },
+    #     },
+    #     **deepcopy(default_weighted_pdb_configs),
+    # },
+    # "recentPDB_1536_sample384_0925": {
+    #     "base_info": {
+    #         "mmcif_dir": os.path.join(PROTENIX_ROOT_DIR, "mmcif"),
+    #         "bioassembly_dict_dir": os.path.join(
+    #             PROTENIX_ROOT_DIR, "recentPDB_bioassembly"
+    #         ),
+    #         "indices_fpath": os.path.join(
+    #             PROTENIX_ROOT_DIR, "indices/recentPDB_low_homology_maxtoken1536.csv"
+    #         ),
+    #         "pdb_list": os.path.join(
+    #             PROTENIX_ROOT_DIR,
+    #             "indices/recentPDB_low_homology_maxtoken1024_sample384_pdb_id.txt",
+    #         ),
+    #         "max_n_token": GlobalConfigValue("test_max_n_token"),  # filter data
+    #         "sort_by_n_token": False,
+    #         "group_by_pdb_id": True,
+    #         "find_eval_chain_interface": True,
+    #     },
+    #     **deepcopy(default_test_configs),
+    # },
+    # "posebusters_0925": {
+    #     "base_info": {
+    #         "mmcif_dir": os.path.join(PROTENIX_ROOT_DIR, "posebusters_mmcif"),
+    #         "bioassembly_dict_dir": os.path.join(
+    #             PROTENIX_ROOT_DIR, "posebusters_bioassembly"
+    #         ),
+    #         "indices_fpath": os.path.join(
+    #             PROTENIX_ROOT_DIR, "indices/posebusters_indices_mainchain_interface.csv"
+    #         ),
+    #         "pdb_list": "",
+    #         "find_pocket": True,
+    #         "find_all_pockets": False,
+    #         "max_n_token": GlobalConfigValue("test_max_n_token"),  # filter data
+    #     },
+    #     **deepcopy(default_test_configs),
+    # },
+    "train_rna_before202606": {
         "base_info": {
-            "mmcif_dir": os.path.join(PROTENIX_ROOT_DIR, "mmcif"),
+            "mmcif_dir": os.path.join(RNA_DATA_ROOT_DIR, "protein_rna"),
             "bioassembly_dict_dir": os.path.join(
-                PROTENIX_ROOT_DIR, "mmcif_bioassembly"
+                RNA_DATA_ROOT_DIR, "train_signal"
             ),
             "indices_fpath": os.path.join(
-                PROTENIX_ROOT_DIR,
-                "indices/weightedPDB_indices_before_2021-09-30_wo_posebusters_resolution_below_9.csv.gz",
+                RNA_DATA_ROOT_DIR, "protein_rna_train_signal.csv"
             ),
             "pdb_list": "",
             "random_sample_if_failed": True,
@@ -157,49 +217,31 @@ data_configs = {
         },
         **deepcopy(default_weighted_pdb_configs),
     },
-    "recentPDB_1536_sample384_0925": {
+    "test_rna_before202606": {
         "base_info": {
-            "mmcif_dir": os.path.join(PROTENIX_ROOT_DIR, "mmcif"),
+            "mmcif_dir": os.path.join(RNA_DATA_ROOT_DIR, "protein_rna"),
             "bioassembly_dict_dir": os.path.join(
-                PROTENIX_ROOT_DIR, "recentPDB_bioassembly"
+                RNA_DATA_ROOT_DIR, "train_signal"
             ),
             "indices_fpath": os.path.join(
-                PROTENIX_ROOT_DIR, "indices/recentPDB_low_homology_maxtoken1536.csv"
+                RNA_DATA_ROOT_DIR, "protein_rna_test_signal.csv"
             ),
-            "pdb_list": os.path.join(
-                PROTENIX_ROOT_DIR,
-                "indices/recentPDB_low_homology_maxtoken1024_sample384_pdb_id.txt",
-            ),
-            "max_n_token": GlobalConfigValue("test_max_n_token"),  # filter data
+            "pdb_list": "",
+            # "max_n_token": GlobalConfigValue("test_max_n_token"),  # filter data
+            "max_n_token": 1600,  # filter data
             "sort_by_n_token": False,
             "group_by_pdb_id": True,
             "find_eval_chain_interface": True,
         },
         **deepcopy(default_test_configs),
     },
-    "posebusters_0925": {
-        "base_info": {
-            "mmcif_dir": os.path.join(PROTENIX_ROOT_DIR, "posebusters_mmcif"),
-            "bioassembly_dict_dir": os.path.join(
-                PROTENIX_ROOT_DIR, "posebusters_bioassembly"
-            ),
-            "indices_fpath": os.path.join(
-                PROTENIX_ROOT_DIR, "indices/posebusters_indices_mainchain_interface.csv"
-            ),
-            "pdb_list": "",
-            "find_pocket": True,
-            "find_all_pockets": False,
-            "max_n_token": GlobalConfigValue("test_max_n_token"),  # filter data
-        },
-        **deepcopy(default_test_configs),
-    },
     "msa": {
         "enable_prot_msa": True,
         "prot_seq_or_filename_to_msadir_jsons": ListValue(
-            [os.path.join(PROTENIX_ROOT_DIR, "common/seq_to_pdb_index.json")]
+            [os.path.join(custom_rna_dir, "pdb_seqs/seq_to_pdb_index.json")]
         ),
         "prot_msadir_raw_paths": ListValue(
-            [os.path.join(PROTENIX_ROOT_DIR, "mmcif_msa_template")]
+            [os.path.join(custom_rna_dir, "mmcif_msa_template")]
         ),
         "prot_pairing_dbs": ListValue(["pairing"]),
         "prot_non_pairing_dbs": ListValue(
@@ -209,10 +251,10 @@ data_configs = {
         "prot_indexing_methods": ListValue(["sequence"]),
         "enable_rna_msa": True,  # enable rna msa
         "rna_seq_or_filename_to_msadir_jsons": ListValue(
-            [os.path.join(PROTENIX_ROOT_DIR, "rna_msa/rna_sequence_to_pdb_chains.json")]
+            [os.path.join(rna_msa_dir, "rna_msa/rna_sequence_to_pdb_chains.json")]
         ),
         "rna_msadir_raw_paths": ListValue(
-            [os.path.join(PROTENIX_ROOT_DIR, "rna_msa/msas")]
+            [os.path.join(rna_msa_dir, "rna_msa/msas")]
         ),
         "rna_indexing_methods": ListValue(["sequence"]),
         "min_size": {
@@ -229,24 +271,8 @@ data_configs = {
         },
     },
     "template": {
-        "enable_prot_template": True,
+        "enable_prot_template": False,
         "template_dropout_rate": 0.0,
-        "prot_template_mmcif_dir": os.path.join(PROTENIX_ROOT_DIR, "mmcif"),
-        "prot_template_cache_dir": "",
-        "prot_template_raw_paths": ListValue(
-            [os.path.join(PROTENIX_ROOT_DIR, "mmcif_msa_template")]
-        ),
-        "prot_seq_or_filename_to_templatedir_jsons": ListValue(
-            [os.path.join(PROTENIX_ROOT_DIR, "common/seq_to_pdb_index.json")]
-        ),
-        "prot_indexing_methods": ListValue(["sequence"]),
-        "release_dates_path": os.path.join(
-            PROTENIX_ROOT_DIR, "common/release_date_cache.json"
-        ),
-        "obsolete_pdbs_path": os.path.join(
-            PROTENIX_ROOT_DIR, "common/obsolete_to_successor.json"
-        ),
-        "kalign_binary_path": "/usr/bin/kalign",  # apt-get install kalign
     },
     "ccd_components_file": os.path.join(PROTENIX_ROOT_DIR, "common/components.cif"),
     "ccd_components_rdkit_mol_file": os.path.join(
@@ -256,6 +282,6 @@ data_configs = {
         PROTENIX_ROOT_DIR, "common/obsolete_release_date.csv"
     ),
     "pdb_cluster_file": os.path.join(
-        PROTENIX_ROOT_DIR, "common/clusters-by-entity-40.txt"
+        custom_rna_dir, "common/clusters-by-entity-40.txt"
     ),
 }

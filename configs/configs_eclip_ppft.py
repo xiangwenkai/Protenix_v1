@@ -46,7 +46,7 @@ eclip_ppft_configs = {
         "signal_binary_threshold": 2.0,
         "signal_clip_value": 100.0,
         "signal_multinomial_max_total": 100.0,
-        "signal_loss_weight": 1.0,
+        "signal_loss_weight": 0.05,
         "confidence_quality_weight": 0.2,
         "confidence_quality_target": 0.8,
         "confidence_monitor_clash": True,

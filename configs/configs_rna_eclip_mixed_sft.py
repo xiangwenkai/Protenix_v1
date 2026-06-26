@@ -12,16 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Configuration for Protenix structure + RNA binding signal SFT."""
+"""Configuration for mixed PDB structure + eCLIP RNA signal SFT."""
 
 
-rna_signal_sft_configs = {
-    "rna_signal_sft": {
-        "signal_profile_weight": 1.0,
-        "signal_multinomial_min_height": 3.0,
-        "signal_binary_threshold": 2.0,
-        "signal_clip_value": 100.0,
-        "signal_multinomial_max_total": 100.0,
-        "signal_loss_weight": 0.05,
+rna_eclip_mixed_sft_configs = {
+    "mixed_sft": {
+        "pdb_sample_prob": 0.5,
+        "freeze_confidence_head": True,
     }
 }
