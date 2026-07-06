@@ -57,9 +57,12 @@ from protenix.model import sample_confidence
 from protenix.model.eclip_binding import (
     EclipSignalLoss,
     align_signal_to_prediction,
+    binary_auprc,
     compute_distogram_binding_score,
+    compute_soft_binding_score,
     get_protein_token_indices,
     get_rna_token_indices,
+    masked_pearson,
     topk_overlap,
 )
 from protenix.model.generator_ppft import sample_diffusion_ppft
@@ -73,7 +76,12 @@ from protenix.utils.seed import seed_everything
 from protenix.utils.torch_utils import autocasting_disable_decorator, to_device
 from protenix.utils.training import get_optimizer, is_loss_nan_check
 from runner.ema import EMAWrapper
-from runner.train_eclip_ppft import featurize_eclip_sample
+from runner.train_eclip_ppft import (
+    configure_eclip_cell_condition,
+    featurize_eclip_sample,
+    load_model_state_dict_allowing_cell_adapter,
+    load_protein_msa_lookup,
+)
 
 torch.serialization.add_safe_globals([Namespace])
 
@@ -145,7 +153,12 @@ class MixedSFTForwardModule(nn.Module):
         self,
         *,
         feat_dict: Dict[str, torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        Dict[str, torch.Tensor],
+        torch.Tensor | None,
+    ]:
         n_cycle = self.eclip_cfg.n_cycle
         if n_cycle is None:
             n_cycle = self.model.N_cycle
@@ -166,7 +179,7 @@ class MixedSFTForwardModule(nn.Module):
         p_bind, _ = compute_distogram_binding_score(contact_probs, feat_dict)
 
         if self.eclip_cfg.confidence_quality_weight <= 0.0:
-            return p_bind, p_bind.sum() * 0.0, {}
+            return p_bind, p_bind.sum() * 0.0, {}, None
 
         cache = {"pair_z": None, "p_lm/c_l": [None, None]}
         if self.model.enable_diffusion_shared_vars_cache:
@@ -225,7 +238,7 @@ class MixedSFTForwardModule(nn.Module):
             s=s,
             z=z,
         )
-        return p_bind, quality_loss, quality_metrics
+        return p_bind, quality_loss, quality_metrics, coords.detach()
 
     def confidence_quality_loss(
         self,
@@ -292,6 +305,10 @@ class RNAEclipMixedSFTTrainer:
         self.eclip_cfg = configs.eclip_ppft
         self.rna_cfg = configs.rna_signal_sft
         self.mixed_cfg = configs.mixed_sft
+        self.protein_msa_lookup = load_protein_msa_lookup(
+            self.eclip_cfg.protein_msa_map_json
+        )
+        self.cell_vocab = configure_eclip_cell_condition(self.configs, self.eclip_cfg)
         self.init_env()
         self.init_basics()
         self.init_log()
@@ -399,11 +416,13 @@ class RNAEclipMixedSFTTrainer:
                 )
             self.train_module = DDP(self.train_module, **ddp_kwargs)
 
+        self.finetune_param_names = self.optimizer_param_patterns()
         self.optimizer = get_optimizer(
             self.configs,
             self.train_module,
-            param_names=self.configs.get("finetune_params_with_substring", [""]),
+            param_names=self.finetune_param_names,
         )
+        self.print(f"Effective finetune param patterns: {self.finetune_param_names}")
         self.init_scheduler()
         if self.configs.get("ema_decay", -1) > 0:
             assert self.configs.ema_decay < 1
@@ -418,8 +437,19 @@ class RNAEclipMixedSFTTrainer:
         n_total = sum(p.numel() for p in self.raw_model.parameters())
         self.print(f"Trainable params: {n_trainable / 1e6:.2f}M / {n_total / 1e6:.2f}M")
 
+    def optimizer_param_patterns(self) -> list[str]:
+        patterns = list(self.configs.get("finetune_params_with_substring", [""]))
+        is_selective_finetune = bool(patterns) and bool(patterns[0])
+        if self.eclip_cfg.use_cell_condition and is_selective_finetune:
+            adapter_pattern = "diffusion_module.cell_adapter."
+            if adapter_pattern not in patterns:
+                patterns.append(adapter_pattern)
+        return patterns
+
     def init_scheduler(self, **kwargs: Any) -> None:
-        finetune_params = self.configs.get("finetune_params_with_substring", [""])
+        finetune_params = getattr(
+            self, "finetune_param_names", self.configs.get("finetune_params_with_substring", [""])
+        )
         is_finetune = len(finetune_params[0]) > 0
         if is_finetune:
             self.lr_scheduler = FinetuneLRScheduler(
@@ -468,6 +498,7 @@ class RNAEclipMixedSFTTrainer:
             min_signal_max=self.eclip_cfg.min_signal_max,
             zero_signal_keep_prob=self.eclip_cfg.zero_signal_keep_prob,
             parquet_batch_size=self.eclip_cfg.parquet_batch_size,
+            cell_vocab=self.cell_vocab,
             seed=self.configs.seed,
             rank=DIST_WRAPPER.rank,
             world_size=DIST_WRAPPER.world_size,
@@ -498,6 +529,15 @@ class RNAEclipMixedSFTTrainer:
             num_workers=0,
             collate_fn=collate_eclip_ppft_samples,
         )
+        if self.protein_msa_lookup:
+            self.print(
+                f"Loaded eCLIP protein MSA map entries: {len(self.protein_msa_lookup)}"
+            )
+        if self.eclip_cfg.use_cell_condition:
+            self.print(
+                f"Using eCLIP cell condition: cells={len(self.cell_vocab)} "
+                f"target={self.eclip_cfg.cell_condition_target}"
+            )
         self._pdb_iter = iter(self.pdb_train_dl)
         self._eclip_iter = iter(self.eclip_train_dl)
 
@@ -512,7 +552,12 @@ class RNAEclipMixedSFTTrainer:
         first_key = next(iter(state_dict))
         if first_key.startswith("module."):
             state_dict = {key[len("module.") :]: value for key, value in state_dict.items()}
-        self.raw_model.load_state_dict(state_dict, strict=self.configs.load_strict)
+        load_model_state_dict_allowing_cell_adapter(
+            self.raw_model,
+            state_dict,
+            strict=self.configs.load_strict,
+            allow_cell_adapter_missing=bool(self.eclip_cfg.use_cell_condition),
+        )
         if not self.configs.load_params_only:
             if not self.configs.skip_load_optimizer and checkpoint.get("optimizer") is not None:
                 self.optimizer.load_state_dict(checkpoint["optimizer"])
@@ -565,7 +610,12 @@ class RNAEclipMixedSFTTrainer:
         return "pdb" if rng.random() < float(self.mixed_cfg.pdb_sample_prob) else "eclip"
 
     def prepare_eclip_feature_dict(self, sample: dict[str, Any]) -> Dict[str, torch.Tensor]:
-        feat_dict, _ = featurize_eclip_sample(sample)
+        feat_dict, _ = featurize_eclip_sample(
+            sample,
+            protein_msa_lookup=self.protein_msa_lookup,
+            protein_msa_pair_as_unpair=self.eclip_cfg.protein_msa_pair_as_unpair,
+            protein_msa_use_rna_msa=self.eclip_cfg.protein_msa_use_rna_msa,
+        )
         feat_dict = to_device(feat_dict, self.device)
         feat_dict = self.raw_model.relative_position_encoding.generate_relp(feat_dict)
         return update_input_feature_dict(feat_dict)
@@ -687,9 +737,11 @@ class RNAEclipMixedSFTTrainer:
     def forward_eclip_sample(
         self,
         sample: dict[str, Any],
+        *,
+        include_rollout_metrics: bool = False,
     ) -> tuple[torch.Tensor, Dict[str, Any]]:
         feat_dict = self.prepare_eclip_feature_dict(sample)
-        p_bind, quality_loss, quality_metrics = self.train_module(
+        p_bind, quality_loss, quality_metrics, rollout_coords = self.train_module(
             task="eclip",
             feat_dict=feat_dict,
         )
@@ -707,8 +759,71 @@ class RNAEclipMixedSFTTrainer:
         metrics["eclip/weighted_signal_loss"] = weighted_signal_loss.detach()
         metrics["eclip/topk_overlap"] = topk_overlap(p_bind.squeeze(0), target, target_mask)
         metrics["eclip/rna_tokens"] = torch.tensor(float(p_bind.shape[-1]), device=p_bind.device)
+        if include_rollout_metrics and rollout_coords is not None:
+            metrics.update(
+                {
+                    f"eclip/rollout_{key}": value
+                    for key, value in self.get_rollout_signal_metrics(
+                        coords=rollout_coords,
+                        feat_dict=feat_dict,
+                        target=target,
+                        target_mask=target_mask,
+                    ).items()
+                }
+            )
         metrics["loss"] = total_loss.detach()
         return total_loss, metrics
+
+    @torch.no_grad()
+    def get_rollout_signal_metrics(
+        self,
+        *,
+        coords: torch.Tensor,
+        feat_dict: Dict[str, torch.Tensor],
+        target: torch.Tensor,
+        target_mask: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        rollout_p_bind, _ = compute_soft_binding_score(
+            coords=coords.float(),
+            feat_dict=feat_dict,
+            cutoff=float(self.mixed_cfg.rollout_metric_contact_cutoff),
+            temperature=0.5,
+            softmin_beta=4.0,
+        )
+        while rollout_p_bind.ndim > 1:
+            rollout_p_bind = rollout_p_bind.mean(dim=0)
+        rollout_p_bind = rollout_p_bind.to(device=target.device, dtype=torch.float32)
+        target = target.to(device=rollout_p_bind.device, dtype=torch.float32)
+        target_mask = target_mask.to(device=rollout_p_bind.device, dtype=torch.bool)
+        length = min(rollout_p_bind.numel(), target.numel(), target_mask.numel())
+        rollout_p_bind = rollout_p_bind[:length]
+        target = target[:length]
+        target_mask = target_mask[:length]
+        if int(target_mask.sum().item()) < 1:
+            zero = rollout_p_bind.sum() * 0.0
+            return {
+                "profile_pcc": zero,
+                "profile_auprc": zero,
+                "p_bind_mean": zero,
+                "p_bind_std": zero,
+            }
+        valid_rollout_p = rollout_p_bind[target_mask]
+        return {
+            "profile_pcc": masked_pearson(
+                rollout_p_bind,
+                target,
+                target_mask,
+                eps=self.eclip_signal_loss.eps,
+            ),
+            "profile_auprc": binary_auprc(
+                rollout_p_bind,
+                target,
+                target_mask,
+                threshold=float(self.eclip_cfg.signal_binary_threshold),
+            ),
+            "p_bind_mean": valid_rollout_p.detach().mean(),
+            "p_bind_std": valid_rollout_p.detach().std(unbiased=False),
+        }
 
     def train_pdb_batch(self, batch: Dict[str, Any]) -> tuple[torch.Tensor, Dict[str, Any]]:
         batch = to_device(batch, self.device)
@@ -861,7 +976,10 @@ class RNAEclipMixedSFTTrainer:
                 break
             for sample in samples:
                 try:
-                    loss, metrics = self.forward_eclip_sample(sample)
+                    loss, metrics = self.forward_eclip_sample(
+                        sample,
+                        include_rollout_metrics=True,
+                    )
                 except Exception:
                     if self.use_ddp or not self.eclip_cfg.skip_bad_samples:
                         raise

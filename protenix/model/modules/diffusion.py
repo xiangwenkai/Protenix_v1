@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -26,6 +26,86 @@ from protenix.model.modules.transformer import (
 )
 from protenix.model.triangular.layers import LayerNorm
 from protenix.model.utils import expand_at_dim, get_checkpoint_fn, permute_final_dims
+
+
+class CellConditionAdapter(nn.Module):
+    """Optional cell-line conditioning applied inside the diffusion module."""
+
+    def __init__(
+        self,
+        *,
+        num_cells: int = 0,
+        embedding_dim: int = 128,
+        c_s: int = 384,
+        target: str = "rna",
+    ) -> None:
+        super().__init__()
+        self.num_cells = max(int(num_cells), 1)
+        self.c_s = int(c_s)
+        self.target = str(target)
+        self.embedding = nn.Embedding(self.num_cells, int(embedding_dim))
+        self.linear = LinearNoBias(
+            in_features=int(embedding_dim),
+            out_features=self.c_s,
+            precision=torch.float32,
+            initializer="zeros",
+        )
+
+    def _token_mask(
+        self,
+        input_feature_dict: dict[str, Any],
+        n_token: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if self.target == "all":
+            return torch.ones(n_token, dtype=torch.bool, device=device)
+
+        feature_name = {"rna": "is_rna", "protein": "is_protein"}.get(self.target)
+        if feature_name is None:
+            raise ValueError(
+                f"Unsupported cell adapter target {self.target!r}; expected 'rna', 'protein', or 'all'."
+            )
+
+        atom_to_token_idx = input_feature_dict.get("atom_to_token_idx")
+        atom_mask = input_feature_dict.get(feature_name)
+        if atom_to_token_idx is None or atom_mask is None:
+            return torch.zeros(n_token, dtype=torch.bool, device=device)
+
+        atom_to_token_idx = atom_to_token_idx.to(device=device).long().flatten()
+        atom_mask = atom_mask.to(device=device).bool().flatten()
+        token_mask = torch.zeros(n_token, dtype=torch.bool, device=device)
+        if atom_mask.any():
+            token_idx = atom_to_token_idx[atom_mask]
+            token_idx = token_idx[(token_idx >= 0) & (token_idx < n_token)]
+            if token_idx.numel() > 0:
+                token_mask[token_idx.unique()] = True
+        return token_mask
+
+    def forward(
+        self,
+        input_feature_dict: dict[str, Any],
+        s_trunk: torch.Tensor,
+    ) -> torch.Tensor:
+        cell_id = input_feature_dict.get("cell_id")
+        if cell_id is None:
+            return s_trunk
+
+        n_token = s_trunk.shape[-2]
+        token_mask = self._token_mask(input_feature_dict, n_token, s_trunk.device)
+        if not token_mask.any():
+            return s_trunk
+
+        cell_id = torch.as_tensor(cell_id, device=s_trunk.device).long()
+        cell_id = cell_id.clamp(min=0, max=self.num_cells - 1)
+        if cell_id.numel() != 1:
+            raise ValueError(
+                f"CellConditionAdapter currently expects a scalar cell_id, got shape {tuple(cell_id.shape)}."
+            )
+
+        delta = self.linear(self.embedding(cell_id.reshape(()))).to(dtype=s_trunk.dtype)
+        delta = delta.reshape(*([1] * (s_trunk.ndim - 1)), self.c_s)
+        mask = token_mask.reshape(*([1] * (s_trunk.ndim - 2)), n_token, 1)
+        return s_trunk + delta * mask.to(dtype=s_trunk.dtype)
 
 
 class DiffusionConditioning(nn.Module):
@@ -267,6 +347,7 @@ class DiffusionModule(nn.Module):
             "drop_path_rate": 0,
         },
         atom_decoder: dict[str, int] = {"n_blocks": 3, "n_heads": 4},
+        cell_adapter: dict[str, Any] | None = None,
         drop_path_rate: float = 0.0,
         blocks_per_ckpt: Optional[int] = None,
         use_fine_grained_checkpoint: bool = False,
@@ -286,6 +367,17 @@ class DiffusionModule(nn.Module):
 
         self.diffusion_conditioning = DiffusionConditioning(
             sigma_data=self.sigma_data, c_z=c_z, c_s=c_s, c_s_inputs=c_s_inputs
+        )
+        cell_adapter = dict(cell_adapter or {})
+        self.cell_adapter = (
+            CellConditionAdapter(
+                num_cells=cell_adapter.get("num_cells", 0),
+                embedding_dim=cell_adapter.get("embedding_dim", 128),
+                c_s=c_s,
+                target=cell_adapter.get("target", "rna"),
+            )
+            if cell_adapter.get("enable", False)
+            else None
         )
         self.atom_attention_encoder = AtomAttentionEncoder(
             **atom_encoder,
@@ -375,6 +467,8 @@ class DiffusionModule(nn.Module):
         blocks_per_ckpt = self.blocks_per_ckpt
         if not torch.is_grad_enabled():
             blocks_per_ckpt = None
+        if self.cell_adapter is not None:
+            s_trunk = self.cell_adapter(input_feature_dict, s_trunk)
         # Conditioning, shared across difference samples
         # Diffusion_conditioning consumes 7-8G when token num is 768,
         # use checkpoint here if blocks_per_ckpt is not None.

@@ -19,5 +19,6 @@ rna_eclip_mixed_sft_configs = {
     "mixed_sft": {
         "pdb_sample_prob": 0.5,
         "freeze_confidence_head": True,
+        "rollout_metric_contact_cutoff": 5.0,
     }
 }

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import datetime
 import hashlib
+import json
 import logging
 import os
 import time
@@ -51,15 +52,20 @@ from protenix.config.config import parse_configs, parse_sys_args, save_config
 from protenix.data.eclip_ppft_dataset import (
     EclipPPFTDataset,
     build_protenix_sample_dict,
+    collect_cell_vocab,
     collate_eclip_ppft_samples,
 )
 from protenix.data.inference.json_to_feature import SampleDictToFeatures
+from protenix.data.msa.msa_featurizer import InferenceMSAFeaturizer
 from protenix.data.utils import data_type_transform, make_dummy_feature
 from protenix.model import sample_confidence
 from protenix.model.eclip_binding import (
     EclipSignalLoss,
     align_signal_to_prediction,
+    binary_auprc,
     compute_distogram_binding_score,
+    compute_soft_binding_score,
+    masked_pearson,
     topk_overlap,
 )
 from protenix.model.generator_ppft import sample_diffusion_ppft
@@ -68,7 +74,7 @@ from protenix.utils.distributed import DIST_WRAPPER
 from protenix.utils.lr_scheduler import get_lr_scheduler
 from protenix.utils.metrics import SimpleMetricAggregator
 from protenix.utils.seed import seed_everything
-from protenix.utils.torch_utils import to_device
+from protenix.utils.torch_utils import dict_to_tensor, to_device
 from protenix.utils.training import is_loss_nan_check
 
 os.environ["WANDB_CONSOLE"] = "off"
@@ -106,16 +112,178 @@ def build_eclip_ppft_checkpoint(
     return checkpoint
 
 
-def featurize_eclip_sample(sample: dict[str, Any]) -> tuple[dict[str, torch.Tensor], AtomArray]:
+ProteinMsaLookup = dict[str, dict[str, str]]
+
+
+def _resolve_msa_path(msa_path: str, base_dir: Path) -> str:
+    path = Path(msa_path)
+    if not path.is_absolute():
+        path = base_dir / path
+    return str(path)
+
+
+def _normalize_msa_info(key: str, value: Any, base_dir: Path) -> dict[str, str]:
+    if isinstance(value, str):
+        msa_info = {"unpairedMsaPath": _resolve_msa_path(value, base_dir)}
+    elif isinstance(value, Mapping):
+        key_map = {
+            "unpairedMsaPath": "unpairedMsaPath",
+            "pairedMsaPath": "pairedMsaPath",
+            "unpaired_msa_path": "unpairedMsaPath",
+            "paired_msa_path": "pairedMsaPath",
+            "non_pairing": "unpairedMsaPath",
+            "pairing": "pairedMsaPath",
+            "non_pairing_a3m": "unpairedMsaPath",
+            "pairing_a3m": "pairedMsaPath",
+        }
+        msa_info = {
+            target_key: _resolve_msa_path(str(value[source_key]), base_dir)
+            for source_key, target_key in key_map.items()
+            if value.get(source_key)
+        }
+        msa_dir = value.get("precomputed_msa_dir") or value.get("msa_dir")
+        if msa_dir:
+            msa_dir = _resolve_msa_path(str(msa_dir), base_dir)
+            unpaired = os.path.join(msa_dir, "non_pairing.a3m")
+            paired = os.path.join(msa_dir, "pairing.a3m")
+            if os.path.exists(unpaired):
+                msa_info.setdefault("unpairedMsaPath", unpaired)
+            if os.path.exists(paired):
+                msa_info.setdefault("pairedMsaPath", paired)
+    else:
+        raise TypeError(f"Unsupported MSA map value for {key!r}: {type(value).__name__}")
+
+    if not msa_info:
+        raise ValueError(f"MSA map entry {key!r} has no usable MSA path.")
+    for msa_key, msa_path in msa_info.items():
+        if not os.path.exists(msa_path):
+            raise FileNotFoundError(f"MSA path for {key!r} ({msa_key}) does not exist: {msa_path}")
+    return msa_info
+
+
+def load_protein_msa_lookup(path: str | None) -> ProteinMsaLookup:
+    if not path:
+        return {}
+    lookup_path = Path(path)
+    with open(lookup_path, "r", encoding="utf-8") as f:
+        raw_lookup = json.load(f)
+    if not isinstance(raw_lookup, dict):
+        raise TypeError("protein_msa_map_json must contain a JSON object.")
+    return {
+        str(key): _normalize_msa_info(str(key), value, lookup_path.parent)
+        for key, value in raw_lookup.items()
+    }
+
+
+def configure_eclip_cell_condition(configs: Any, eclip_cfg: Any) -> dict[str, int]:
+    use_cell_condition = bool(eclip_cfg.use_cell_condition)
+    cell_vocab = collect_cell_vocab(eclip_cfg.data_dir) if use_cell_condition else {}
+    cell_adapter = configs.model.diffusion_module.cell_adapter
+    cell_adapter.enable = use_cell_condition
+    cell_adapter.num_cells = len(cell_vocab) + 1 if use_cell_condition else 0
+    cell_adapter.embedding_dim = int(eclip_cfg.cell_condition_dim)
+    cell_adapter.target = str(eclip_cfg.cell_condition_target)
+    return cell_vocab
+
+
+def load_model_state_dict_allowing_cell_adapter(
+    model: nn.Module,
+    state_dict: dict[str, torch.Tensor],
+    *,
+    strict: bool,
+    allow_cell_adapter_missing: bool,
+) -> None:
+    if not strict or not allow_cell_adapter_missing:
+        model.load_state_dict(state_dict, strict=strict)
+        return
+
+    incompatible = model.load_state_dict(state_dict, strict=False)
+    missing = list(incompatible.missing_keys)
+    unexpected = list(incompatible.unexpected_keys)
+    disallowed_missing = [
+        key
+        for key in missing
+        if not key.startswith("diffusion_module.cell_adapter.")
+    ]
+    if disallowed_missing or unexpected:
+        raise RuntimeError(
+            "Checkpoint is not strict-compatible after allowing cell adapter params. "
+            f"missing={disallowed_missing}, unexpected={unexpected}"
+        )
+
+
+def _lookup_protein_msa_info(
+    sample: dict[str, Any],
+    protein_msa_lookup: ProteinMsaLookup | None,
+) -> dict[str, str] | None:
+    if not protein_msa_lookup:
+        return None
+    protein_sequence = str(sample.get("protein_sequence", ""))
+    sequence_sha1 = hashlib.sha1(protein_sequence.encode("utf-8")).hexdigest()
+    candidate_keys = [
+        str(sample.get("protein_symbol", "")),
+        protein_sequence,
+        sequence_sha1,
+        f"sha1:{sequence_sha1}",
+    ]
+    for key in candidate_keys:
+        if key and key in protein_msa_lookup:
+            return protein_msa_lookup[key]
+    return None
+
+
+def _attach_protein_msa_info(
+    sample_dict: dict[str, Any],
+    sample: dict[str, Any],
+    protein_msa_lookup: ProteinMsaLookup | None,
+) -> bool:
+    msa_info = _lookup_protein_msa_info(sample, protein_msa_lookup)
+    if msa_info is None:
+        return False
+    for sequence_entry in sample_dict["sequences"]:
+        protein_chain = sequence_entry.get("proteinChain")
+        if protein_chain is not None:
+            protein_chain.update(msa_info)
+            return True
+    return False
+
+
+def featurize_eclip_sample(
+    sample: dict[str, Any],
+    protein_msa_lookup: ProteinMsaLookup | None = None,
+    *,
+    protein_msa_pair_as_unpair: bool = True,
+    protein_msa_use_rna_msa: bool = False,
+) -> tuple[dict[str, torch.Tensor], AtomArray]:
     """Build Protenix inference-style features without structure labels."""
 
     sample_dict = build_protenix_sample_dict(sample)
+    has_protein_msa = _attach_protein_msa_info(
+        sample_dict=sample_dict,
+        sample=sample,
+        protein_msa_lookup=protein_msa_lookup,
+    )
     sample2feat = SampleDictToFeatures(sample_dict)
     features_dict, atom_array, _ = sample2feat.get_feature_dict()
     features_dict["distogram_rep_atom_mask"] = torch.tensor(
         atom_array.distogram_rep_atom_mask
     ).long()
-    features_dict = make_dummy_feature(features_dict=features_dict, dummy_feats=["msa", "template"])
+    features_dict["cell_id"] = torch.tensor(
+        int(sample.get("cell_id", 0)),
+        dtype=torch.long,
+    )
+    dummy_feats = ["template"]
+    if has_protein_msa:
+        msa_features = InferenceMSAFeaturizer.make_msa_feature(
+            bioassembly=sample_dict["sequences"],
+            atom_array=atom_array,
+            msa_pair_as_unpair=protein_msa_pair_as_unpair,
+            use_rna_msa=protein_msa_use_rna_msa,
+        )
+        features_dict.update(dict_to_tensor(msa_features))
+    else:
+        dummy_feats.append("msa")
+    features_dict = make_dummy_feature(features_dict=features_dict, dummy_feats=dummy_feats)
     return data_type_transform(features_dict), atom_array
 
 
@@ -147,6 +315,7 @@ class EclipPPFTForwardModule(nn.Module):
         torch.Tensor,
         torch.Tensor,
         dict[str, torch.Tensor],
+        torch.Tensor | None,
     ]:
         n_cycle = self.eclip_cfg.n_cycle
         if n_cycle is None:
@@ -168,7 +337,7 @@ class EclipPPFTForwardModule(nn.Module):
         p_bind, _ = compute_distogram_binding_score(contact_probs, feat_dict)
 
         if self.eclip_cfg.confidence_quality_weight <= 0.0:
-            return p_bind, p_bind.sum() * 0.0, {}
+            return p_bind, p_bind.sum() * 0.0, {}, None
 
         cache = {"pair_z": None, "p_lm/c_l": [None, None]}
         if self.model.enable_diffusion_shared_vars_cache:
@@ -225,7 +394,7 @@ class EclipPPFTForwardModule(nn.Module):
             s=s,
             z=z,
         )
-        return p_bind, quality_loss, quality_metrics
+        return p_bind, quality_loss, quality_metrics, coords.detach()
 
     def confidence_quality_loss(
         self,
@@ -291,6 +460,10 @@ class EclipPPFTTrainer:
     def __init__(self, configs: Any) -> None:
         self.configs = configs
         self.eclip_cfg = configs.eclip_ppft
+        self.protein_msa_lookup = load_protein_msa_lookup(
+            self.eclip_cfg.protein_msa_map_json
+        )
+        self.cell_vocab = configure_eclip_cell_condition(self.configs, self.eclip_cfg)
         self.init_env()
         self.init_dirs()
         self.init_log()
@@ -441,6 +614,7 @@ class EclipPPFTTrainer:
             min_signal_max=self.eclip_cfg.min_signal_max,
             zero_signal_keep_prob=self.eclip_cfg.zero_signal_keep_prob,
             parquet_batch_size=self.eclip_cfg.parquet_batch_size,
+            cell_vocab=self.cell_vocab,
             seed=self.configs.seed,
             rank=DIST_WRAPPER.rank,
             world_size=DIST_WRAPPER.world_size,
@@ -471,6 +645,15 @@ class EclipPPFTTrainer:
             num_workers=0,
             collate_fn=collate_eclip_ppft_samples,
         )
+        if self.protein_msa_lookup:
+            self.print(
+                f"Loaded protein MSA map entries: {len(self.protein_msa_lookup)}"
+            )
+        if self.eclip_cfg.use_cell_condition:
+            self.print(
+                f"Using eCLIP cell condition: cells={len(self.cell_vocab)} "
+                f"target={self.eclip_cfg.cell_condition_target}"
+            )
 
     def freeze_and_select_trainable_parameters(self) -> None:
         for param in self.model.parameters():
@@ -498,6 +681,8 @@ class EclipPPFTTrainer:
                 f"pairformer_stack.blocks.{idx}."
                 for idx in range(n_pair_blocks - keep_pair, n_pair_blocks)
             )
+        if self.eclip_cfg.use_cell_condition:
+            patterns.append("diffusion_module.cell_adapter.")
         patterns.extend(list(self.eclip_cfg.extra_trainable_substrings))
         return [pattern for pattern in patterns if pattern]
 
@@ -535,7 +720,12 @@ class EclipPPFTTrainer:
         first_key = next(iter(state_dict))
         if first_key.startswith("module."):
             state_dict = {key[len("module.") :]: value for key, value in state_dict.items()}
-        self.raw_model.load_state_dict(state_dict, strict=self.configs.load_strict)
+        load_model_state_dict_allowing_cell_adapter(
+            self.raw_model,
+            state_dict,
+            strict=self.configs.load_strict,
+            allow_cell_adapter_missing=bool(self.eclip_cfg.use_cell_condition),
+        )
         if not self.configs.load_params_only:
             if not self.configs.skip_load_optimizer and checkpoint.get("optimizer") is not None:
                 self.optimizer.load_state_dict(checkpoint["optimizer"])
@@ -590,7 +780,12 @@ class EclipPPFTTrainer:
     def prepare_input_feature_dict(
         self, sample: dict[str, Any]
     ) -> dict[str, torch.Tensor]:
-        feat_dict, _ = featurize_eclip_sample(sample)
+        feat_dict, _ = featurize_eclip_sample(
+            sample,
+            protein_msa_lookup=self.protein_msa_lookup,
+            protein_msa_pair_as_unpair=self.eclip_cfg.protein_msa_pair_as_unpair,
+            protein_msa_use_rna_msa=self.eclip_cfg.protein_msa_use_rna_msa,
+        )
         feat_dict = to_device(feat_dict, self.device)
         feat_dict = self.model.relative_position_encoding.generate_relp(feat_dict)
         feat_dict = update_input_feature_dict(feat_dict)
@@ -602,13 +797,19 @@ class EclipPPFTTrainer:
         torch.Tensor,
         torch.Tensor,
         dict[str, torch.Tensor],
+        torch.Tensor | None,
     ]:
-        p_bind, quality_loss, quality_metrics = self.train_module(feat_dict)
-        return p_bind, quality_loss, quality_metrics
+        p_bind, quality_loss, quality_metrics, rollout_coords = self.train_module(feat_dict)
+        return p_bind, quality_loss, quality_metrics, rollout_coords
 
-    def forward_sample(self, sample: dict[str, Any]) -> tuple[torch.Tensor, dict[str, Any]]:
+    def forward_sample(
+        self,
+        sample: dict[str, Any],
+        *,
+        include_rollout_metrics: bool = False,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
         feat_dict = self.prepare_input_feature_dict(sample)
-        p_bind, quality_loss, quality_metrics = self.rollout_and_score(feat_dict)
+        p_bind, quality_loss, quality_metrics, rollout_coords = self.rollout_and_score(feat_dict)
 
         target, target_mask = align_signal_to_prediction(
             sample["signal_vector"],
@@ -623,7 +824,70 @@ class EclipPPFTTrainer:
         metrics["loss"] = total_loss.detach()
         metrics["topk_overlap"] = topk_overlap(p_bind.squeeze(0), target, target_mask)
         metrics["rna_tokens"] = torch.tensor(float(p_bind.shape[-1]), device=p_bind.device)
+        if include_rollout_metrics and rollout_coords is not None:
+            metrics.update(
+                {
+                    f"rollout_{key}": value
+                    for key, value in self.get_rollout_signal_metrics(
+                        coords=rollout_coords,
+                        feat_dict=feat_dict,
+                        target=target,
+                        target_mask=target_mask,
+                    ).items()
+                }
+            )
         return total_loss, metrics
+
+    @torch.no_grad()
+    def get_rollout_signal_metrics(
+        self,
+        *,
+        coords: torch.Tensor,
+        feat_dict: dict[str, torch.Tensor],
+        target: torch.Tensor,
+        target_mask: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        rollout_p_bind, _ = compute_soft_binding_score(
+            coords=coords.float(),
+            feat_dict=feat_dict,
+            cutoff=float(self.eclip_cfg.rollout_metric_contact_cutoff),
+            temperature=0.5,
+            softmin_beta=4.0,
+        )
+        while rollout_p_bind.ndim > 1:
+            rollout_p_bind = rollout_p_bind.mean(dim=0)
+        rollout_p_bind = rollout_p_bind.to(device=target.device, dtype=torch.float32)
+        target = target.to(device=rollout_p_bind.device, dtype=torch.float32)
+        target_mask = target_mask.to(device=rollout_p_bind.device, dtype=torch.bool)
+        length = min(rollout_p_bind.numel(), target.numel(), target_mask.numel())
+        rollout_p_bind = rollout_p_bind[:length]
+        target = target[:length]
+        target_mask = target_mask[:length]
+        if int(target_mask.sum().item()) < 1:
+            zero = rollout_p_bind.sum() * 0.0
+            return {
+                "profile_pcc": zero,
+                "profile_auprc": zero,
+                "p_bind_mean": zero,
+                "p_bind_std": zero,
+            }
+        valid_rollout_p = rollout_p_bind[target_mask]
+        return {
+            "profile_pcc": masked_pearson(
+                rollout_p_bind,
+                target,
+                target_mask,
+                eps=self.signal_loss.eps,
+            ),
+            "profile_auprc": binary_auprc(
+                rollout_p_bind,
+                target,
+                target_mask,
+                threshold=float(self.eclip_cfg.signal_binary_threshold),
+            ),
+            "p_bind_mean": valid_rollout_p.detach().mean(),
+            "p_bind_std": valid_rollout_p.detach().std(unbiased=False),
+        }
 
     def train_batch(self, samples: list[dict[str, Any]]) -> dict[str, float]:
         self.train_module.train()
@@ -707,7 +971,10 @@ class EclipPPFTTrainer:
                 break
             for sample in samples:
                 try:
-                    loss, metrics = self.forward_sample(sample)
+                    loss, metrics = self.forward_sample(
+                        sample,
+                        include_rollout_metrics=True,
+                    )
                 except Exception:
                     if self.use_ddp or not self.eclip_cfg.skip_bad_samples:
                         raise

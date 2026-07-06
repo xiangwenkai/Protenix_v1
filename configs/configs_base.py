@@ -275,6 +275,12 @@ model_configs = {
                 "n_blocks": 3,
                 "n_heads": 4,
             },
+            "cell_adapter": {
+                "enable": False,
+                "num_cells": 0,
+                "embedding_dim": 128,
+                "target": "rna",
+            },
             "blocks_per_ckpt": GlobalConfigValue("blocks_per_ckpt"),
         },
         "confidence_head": {

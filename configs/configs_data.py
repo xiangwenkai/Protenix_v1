@@ -228,7 +228,7 @@ data_configs = {
             ),
             "pdb_list": "",
             # "max_n_token": GlobalConfigValue("test_max_n_token"),  # filter data
-            "max_n_token": 1600,  # filter data
+            "max_n_token": 2000,  # filter data
             "sort_by_n_token": False,
             "group_by_pdb_id": True,
             "find_eval_chain_interface": True,

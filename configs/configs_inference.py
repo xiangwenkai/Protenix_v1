@@ -24,6 +24,7 @@ inference_configs = {
     "seeds": ListValue([101]),
     "dump_dir": "./output",
     "need_atom_confidence": False,
+    "dump_contact_probs": False,
     "sorted_by_ranking_score": True,
     "input_json_path": RequiredValue(str),
     "load_checkpoint_dir": os.path.join(PROTENIX_ROOT_DIR, "checkpoint"),

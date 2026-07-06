@@ -79,6 +79,7 @@ class InferenceRunner(object):
         self.init_dumper(
             need_atom_confidence=configs.need_atom_confidence,
             sorted_by_ranking_score=configs.sorted_by_ranking_score,
+            dump_contact_probs=configs.dump_contact_probs,
         )
 
     def init_env(self) -> None:
@@ -184,7 +185,10 @@ class InferenceRunner(object):
         self.print(f"Model parameters: {count_parameters(self.model):.2f}M")
 
     def init_dumper(
-        self, need_atom_confidence: bool = False, sorted_by_ranking_score: bool = True
+        self,
+        need_atom_confidence: bool = False,
+        sorted_by_ranking_score: bool = True,
+        dump_contact_probs: bool = False,
     ) -> None:
         """
         Initialize the data dumper for saving predictions.
@@ -192,11 +196,13 @@ class InferenceRunner(object):
         Args:
             need_atom_confidence (bool): Whether to dump atom-level confidence.
             sorted_by_ranking_score (bool): Whether to sort results by ranking score.
+            dump_contact_probs (bool): Whether to dump RNA-protein contact sidecars.
         """
         self.dumper = DataDumper(
             base_dir=self.dump_dir,
             need_atom_confidence=need_atom_confidence,
             sorted_by_ranking_score=sorted_by_ranking_score,
+            dump_contact_probs=dump_contact_probs,
         )
 
     # Adapted from runner.train.AF3Trainer.evaluate

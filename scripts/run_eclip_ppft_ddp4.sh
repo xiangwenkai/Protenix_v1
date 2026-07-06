@@ -164,4 +164,5 @@ torchrun --standalone --nproc_per_node=4 runner/train_rna_eclip_mixed_sft.py \
   --eclip_ppft.confidence_quality_target 0.8 \
   --eclip_ppft.confidence_rollout_steps 20 \
   --rna_signal_sft.signal_loss_weight 0.05 \
-  --mixed_sft.pdb_sample_prob 0.2
+  --mixed_sft.pdb_sample_prob 0.2 \
+  --mixed_sft.rollout_metric_contact_cutoff 5.0
