@@ -56,14 +56,11 @@ from protenix.metrics.lddt_metrics import LDDTMetrics
 from protenix.model import sample_confidence
 from protenix.model.eclip_binding import (
     EclipSignalLoss,
+    StructureSignalKLLoss,
     align_signal_to_prediction,
-    binary_auprc,
     compute_distogram_binding_score,
-    compute_soft_binding_score,
     get_protein_token_indices,
     get_rna_token_indices,
-    masked_pearson,
-    topk_overlap,
 )
 from protenix.model.generator_ppft import sample_diffusion_ppft
 from protenix.model.loss import ProtenixLoss
@@ -275,25 +272,8 @@ class MixedSFTForwardModule(nn.Module):
             target - plddt_mean
         )
         metrics = {
-            "plddt_mean": plddt_mean.detach(),
-            "plddt_min": atom_plddt.detach().amin(),
             "quality_loss": quality_loss.detach(),
         }
-        if self.eclip_cfg.confidence_monitor_clash:
-            with torch.no_grad():
-                is_polymer = (
-                    feat_dict["is_protein"].bool()
-                    | feat_dict["is_rna"].bool()
-                    | feat_dict["is_dna"].bool()
-                )
-                has_clash = sample_confidence.calculate_clash(
-                    pred_coordinate=coords.detach().float(),
-                    asym_id=feat_dict["asym_id"].long(),
-                    atom_to_token_idx=feat_dict["atom_to_token_idx"].long(),
-                    is_polymer=is_polymer.long(),
-                    threshold=self.configs.metrics.clash.af3_clash_threshold,
-                )
-                metrics["has_clash"] = has_clash.float().mean()
         return quality_loss, metrics
 
 
@@ -467,12 +447,11 @@ class RNAEclipMixedSFTTrainer:
             self.configs, error_dir=str(self.error_dir)
         )
         self.lddt_metrics = LDDTMetrics(self.configs)
-        self.pdb_signal_loss = EclipSignalLoss(
+        self.pdb_signal_loss = StructureSignalKLLoss(
             profile_weight=self.rna_cfg.signal_profile_weight,
-            min_height=self.rna_cfg.signal_multinomial_min_height,
+            target_threshold=self.rna_cfg.signal_target_threshold,
+            min_peak=self.rna_cfg.signal_min_peak,
             binary_threshold=self.rna_cfg.signal_binary_threshold,
-            signal_clip_value=self.rna_cfg.signal_clip_value,
-            max_total_count=self.rna_cfg.signal_multinomial_max_total,
         ).to(self.device)
         self.eclip_signal_loss = EclipSignalLoss(
             profile_weight=self.eclip_cfg.signal_profile_weight,
@@ -634,12 +613,8 @@ class RNAEclipMixedSFTTrainer:
         if ref_tensor is None:
             ref_tensor = batch["input_feature_dict"]["atom_to_token_idx"].float()
         zero = ref_tensor.float().sum() * 0.0
-        metrics = {
-            "loss": zero.detach(),
-            "skipped": torch.tensor(1.0, device=zero.device),
-        }
-        metrics[f"{reason}_target"] = torch.tensor(1.0, device=zero.device)
-        return zero, metrics
+        _ = reason
+        return zero, {"loss": zero.detach()}
 
     def _get_contact_probs(self, pred_dict: Dict[str, torch.Tensor]) -> torch.Tensor:
         if "distogram" in pred_dict:
@@ -692,10 +667,6 @@ class RNAEclipMixedSFTTrainer:
             return self._zero_signal_loss(batch, reason="empty")
 
         signal_loss, metrics = self.pdb_signal_loss(p_bind, target, target_mask)
-        p_bind_1d = p_bind.squeeze(0) if p_bind.ndim > 1 and p_bind.shape[0] == 1 else p_bind
-        metrics["topk_overlap"] = topk_overlap(p_bind_1d, target, target_mask)
-        metrics["valid_tokens"] = target_mask.float().sum()
-        metrics["skipped"] = torch.tensor(0.0, device=p_bind.device)
         return signal_loss, metrics
 
     def forward_pdb_batch(
@@ -757,73 +728,9 @@ class RNAEclipMixedSFTTrainer:
         metrics = {f"eclip/{key}": value for key, value in metrics.items()}
         metrics.update({f"eclip/confidence/{key}": value for key, value in quality_metrics.items()})
         metrics["eclip/weighted_signal_loss"] = weighted_signal_loss.detach()
-        metrics["eclip/topk_overlap"] = topk_overlap(p_bind.squeeze(0), target, target_mask)
-        metrics["eclip/rna_tokens"] = torch.tensor(float(p_bind.shape[-1]), device=p_bind.device)
-        if include_rollout_metrics and rollout_coords is not None:
-            metrics.update(
-                {
-                    f"eclip/rollout_{key}": value
-                    for key, value in self.get_rollout_signal_metrics(
-                        coords=rollout_coords,
-                        feat_dict=feat_dict,
-                        target=target,
-                        target_mask=target_mask,
-                    ).items()
-                }
-            )
+        _ = include_rollout_metrics, rollout_coords
         metrics["loss"] = total_loss.detach()
         return total_loss, metrics
-
-    @torch.no_grad()
-    def get_rollout_signal_metrics(
-        self,
-        *,
-        coords: torch.Tensor,
-        feat_dict: Dict[str, torch.Tensor],
-        target: torch.Tensor,
-        target_mask: torch.Tensor,
-    ) -> Dict[str, torch.Tensor]:
-        rollout_p_bind, _ = compute_soft_binding_score(
-            coords=coords.float(),
-            feat_dict=feat_dict,
-            cutoff=float(self.mixed_cfg.rollout_metric_contact_cutoff),
-            temperature=0.5,
-            softmin_beta=4.0,
-        )
-        while rollout_p_bind.ndim > 1:
-            rollout_p_bind = rollout_p_bind.mean(dim=0)
-        rollout_p_bind = rollout_p_bind.to(device=target.device, dtype=torch.float32)
-        target = target.to(device=rollout_p_bind.device, dtype=torch.float32)
-        target_mask = target_mask.to(device=rollout_p_bind.device, dtype=torch.bool)
-        length = min(rollout_p_bind.numel(), target.numel(), target_mask.numel())
-        rollout_p_bind = rollout_p_bind[:length]
-        target = target[:length]
-        target_mask = target_mask[:length]
-        if int(target_mask.sum().item()) < 1:
-            zero = rollout_p_bind.sum() * 0.0
-            return {
-                "profile_pcc": zero,
-                "profile_auprc": zero,
-                "p_bind_mean": zero,
-                "p_bind_std": zero,
-            }
-        valid_rollout_p = rollout_p_bind[target_mask]
-        return {
-            "profile_pcc": masked_pearson(
-                rollout_p_bind,
-                target,
-                target_mask,
-                eps=self.eclip_signal_loss.eps,
-            ),
-            "profile_auprc": binary_auprc(
-                rollout_p_bind,
-                target,
-                target_mask,
-                threshold=float(self.eclip_cfg.signal_binary_threshold),
-            ),
-            "p_bind_mean": valid_rollout_p.detach().mean(),
-            "p_bind_std": valid_rollout_p.detach().std(unbiased=False),
-        }
 
     def train_pdb_batch(self, batch: Dict[str, Any]) -> tuple[torch.Tensor, Dict[str, Any]]:
         batch = to_device(batch, self.device)

@@ -29,11 +29,10 @@ from configs.configs_rna_signal_sft import rna_signal_sft_configs
 from protenix.config.config import parse_configs, parse_sys_args
 from protenix.model import sample_confidence
 from protenix.model.eclip_binding import (
-    EclipSignalLoss,
+    StructureSignalKLLoss,
     compute_distogram_binding_score,
     get_protein_token_indices,
     get_rna_token_indices,
-    topk_overlap,
 )
 from protenix.utils.torch_utils import autocasting_disable_decorator
 from runner.train import AF3Trainer
@@ -60,12 +59,11 @@ class RNASignalSFTTrainer(AF3Trainer):
     def init_loss(self) -> None:
         super().init_loss()
         cfg = self.configs.rna_signal_sft
-        self.signal_loss = EclipSignalLoss(
+        self.signal_loss = StructureSignalKLLoss(
             profile_weight=cfg.signal_profile_weight,
-            min_height=cfg.signal_multinomial_min_height,
+            target_threshold=cfg.signal_target_threshold,
+            min_peak=cfg.signal_min_peak,
             binary_threshold=cfg.signal_binary_threshold,
-            signal_clip_value=cfg.signal_clip_value,
-            max_total_count=cfg.signal_multinomial_max_total,
         ).to(self.device)
         for param in self.signal_loss.parameters():
             param.requires_grad_(False)
@@ -84,19 +82,8 @@ class RNASignalSFTTrainer(AF3Trainer):
         if ref_tensor is None:
             ref_tensor = batch["input_feature_dict"]["atom_to_token_idx"].float()
         zero = ref_tensor.float().sum() * 0.0
-        metrics = {
-            "loss": zero.detach(),
-            "skipped": torch.tensor(1.0, device=zero.device),
-        }
-        if reason == "missing":
-            metrics["missing_label"] = torch.tensor(1.0, device=zero.device)
-        elif reason == "empty":
-            metrics["empty_target"] = torch.tensor(1.0, device=zero.device)
-        elif reason == "no_rna":
-            metrics["no_rna_token"] = torch.tensor(1.0, device=zero.device)
-        elif reason == "no_protein":
-            metrics["no_protein_token"] = torch.tensor(1.0, device=zero.device)
-        return zero, metrics
+        _ = reason
+        return zero, {"loss": zero.detach()}
 
     def _get_contact_probs(self, pred_dict: Dict[str, torch.Tensor]) -> torch.Tensor:
         if "distogram" in pred_dict:
@@ -150,10 +137,6 @@ class RNASignalSFTTrainer(AF3Trainer):
             return self._zero_signal_loss(batch, reason="empty")
 
         signal_loss, metrics = self.signal_loss(p_bind, target, target_mask)
-        p_bind_1d = p_bind.squeeze(0) if p_bind.ndim > 1 and p_bind.shape[0] == 1 else p_bind
-        metrics["topk_overlap"] = topk_overlap(p_bind_1d, target, target_mask)
-        metrics["valid_tokens"] = target_mask.float().sum()
-        metrics["skipped"] = torch.tensor(0.0, device=p_bind.device)
         return signal_loss, metrics
 
     def get_loss(

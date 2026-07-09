@@ -103,6 +103,10 @@ torchrun --standalone --nproc_per_node=4 runner/train_rna_signal_sft.py \
   --loss.weight.alpha_distogram 0.03 \
   --loss.weight.alpha_bond 1.0 \
   --loss.weight.smooth_lddt 1.0 \
+  --rna_signal_sft.signal_target_threshold 0.0 \
+  --rna_signal_sft.signal_min_peak 0.5 \
+  --rna_signal_sft.signal_binary_threshold 0.5 \
+  --rna_signal_sft.signal_loss_weight 0.05 \
   --triangle_attention cuequivariance \
   --triangle_multiplicative cuequivariance \
   --load_checkpoint_path /inspire/ssd/project/sais-bio/public/xiangwenkai/Protenix_v1/checkpoint/protenix_base_default_v1.0.0.pt \
@@ -163,6 +167,9 @@ torchrun --standalone --nproc_per_node=4 runner/train_rna_eclip_mixed_sft.py \
   --eclip_ppft.confidence_quality_weight 0.2 \
   --eclip_ppft.confidence_quality_target 0.8 \
   --eclip_ppft.confidence_rollout_steps 20 \
+  --rna_signal_sft.signal_target_threshold 0.0 \
+  --rna_signal_sft.signal_min_peak 0.5 \
+  --rna_signal_sft.signal_binary_threshold 0.5 \
   --rna_signal_sft.signal_loss_weight 0.05 \
   --mixed_sft.pdb_sample_prob 0.2 \
   --mixed_sft.rollout_metric_contact_cutoff 5.0

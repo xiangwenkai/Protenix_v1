@@ -18,10 +18,14 @@
 rna_signal_sft_configs = {
     "rna_signal_sft": {
         "signal_profile_weight": 1.0,
+        "signal_target_threshold": 0.0,
+        "signal_min_peak": 0.5,
+        "signal_binary_threshold": 0.5,
+        "signal_loss_weight": 0.05,
+        # Deprecated count-profile options kept for compatibility with older
+        # command lines. PDB signal loss now uses normalized KL divergence.
         "signal_multinomial_min_height": 3.0,
-        "signal_binary_threshold": 2.0,
         "signal_clip_value": 100.0,
         "signal_multinomial_max_total": 100.0,
-        "signal_loss_weight": 0.05,
     }
 }

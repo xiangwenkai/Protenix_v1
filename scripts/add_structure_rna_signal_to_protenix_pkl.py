@@ -46,40 +46,12 @@ except ImportError:  # pragma: no cover - depends on runtime environment.
 
 LOGGER = logging.getLogger(__name__)
 
-PHOSPHATE_ATOMS = {"P", "OP1", "OP2", "OP3", "O1P", "O2P", "O3P", "O5'", "O5*"}
-SUGAR_ATOMS = {
-    "C1'",
-    "C1*",
-    "C2'",
-    "C2*",
-    "C3'",
-    "C3*",
-    "C4'",
-    "C4*",
-    "C5'",
-    "C5*",
-    "O2'",
-    "O2*",
-    "O3'",
-    "O3*",
-    "O4'",
-    "O4*",
-}
-
-
 @dataclass(frozen=True)
 class SignalConfig:
-    contact_radius: float = 6.0
-    contact_midpoint: float = 4.0
+    contact_radius: float = 8.0
+    contact_midpoint: float = 6.0
     contact_temperature: float = 1.0
-    base_weight: float = 1.0
-    sugar_weight: float = 0.7
-    phosphate_weight: float = 0.4
     protein_atom_chunk_size: int = 65536
-
-
-def _clean_atom_name(name: Any) -> str:
-    return str(name).strip().upper()
 
 
 def _is_heavy_atom_array(atom_array: Any) -> np.ndarray:
@@ -104,13 +76,35 @@ def _soft_contact(distance: float, midpoint: float, temperature: float) -> float
     return 1.0 / (1.0 + math.exp(-x))
 
 
-def _rna_atom_group(atom_name: str) -> str:
-    name = _clean_atom_name(atom_name)
-    if name in PHOSPHATE_ATOMS:
-        return "phosphate"
-    if name in SUGAR_ATOMS:
-        return "sugar"
-    return "base"
+def _distogram_rep_atom_mask(atom_array: Any, token_atoms: list[np.ndarray]) -> np.ndarray:
+    """Return the AF3/Protenix distogram representative atom mask."""
+
+    n_atom = len(atom_array)
+    rep_mask = getattr(atom_array, "distogram_rep_atom_mask", None)
+    if rep_mask is not None:
+        return np.asarray(rep_mask).astype(bool)
+
+    atom_names = np.asarray(atom_array.atom_name).astype(str)
+    atom_names_clean = np.char.upper(np.char.strip(atom_names))
+    res_names = np.asarray(getattr(atom_array, "res_name", [""] * n_atom)).astype(str)
+    res_names = np.char.upper(np.char.strip(res_names))
+    is_protein = np.asarray(atom_array.is_protein).astype(bool)
+    is_rna = np.asarray(atom_array.is_rna).astype(bool)
+
+    rep_mask = np.zeros(n_atom, dtype=np.bool_)
+    rep_mask |= is_protein & (res_names != "GLY") & (atom_names_clean == "CB")
+    rep_mask |= is_protein & (res_names == "GLY") & (atom_names_clean == "CA")
+    rep_mask |= is_rna & np.isin(res_names, ["A", "G"]) & (atom_names_clean == "C4")
+    rep_mask |= is_rna & np.isin(res_names, ["C", "U"]) & (atom_names_clean == "C2")
+    rep_mask |= is_rna & (res_names == "N") & np.isin(atom_names_clean, ["C1'", "C1*"])
+
+    heavy_mask = _is_heavy_atom_array(atom_array)
+    for atom_indices in token_atoms:
+        if atom_indices.size and not np.any(rep_mask[atom_indices]):
+            fallback_atoms = atom_indices[heavy_mask[atom_indices]]
+            if fallback_atoms.size:
+                rep_mask[int(fallback_atoms[0])] = True
+    return rep_mask
 
 
 def _token_atom_arrays(token_array: Any) -> list[np.ndarray]:
@@ -163,13 +157,6 @@ def _query_candidate_protein_tokens(
     return np.unique(atom_to_token[global_indices])
 
 
-def _min_distance(coords_a: np.ndarray, coords_b: np.ndarray) -> float | None:
-    if coords_a.size == 0 or coords_b.size == 0:
-        return None
-    distances = np.linalg.norm(coords_a[:, None, :] - coords_b[None, :, :], axis=-1)
-    return float(distances.min())
-
-
 def compute_token_binding_signal(
     bioassembly_dict: dict[str, Any],
     config: SignalConfig,
@@ -190,31 +177,21 @@ def compute_token_binding_signal(
     is_resolved = np.asarray(getattr(atom_array, "is_resolved", np.ones(n_atom))).astype(bool)
     is_heavy = _is_heavy_atom_array(atom_array)
     coords = np.asarray(atom_array.coord, dtype=np.float32)
-    atom_names = np.asarray(atom_array.atom_name).astype(str)
 
     token_atoms = _token_atom_arrays(token_array)
     atom_to_token = _atom_to_token(token_atoms, n_atom)
+    distogram_rep_atom_mask = _distogram_rep_atom_mask(atom_array, token_atoms)
 
-    protein_mask = is_protein & is_heavy & is_resolved
+    protein_mask = is_protein & is_heavy & is_resolved & distogram_rep_atom_mask
     protein_atom_indices = np.nonzero(protein_mask)[0].astype(np.int64)
     protein_coords = coords[protein_atom_indices]
     protein_tree = cKDTree(protein_coords) if cKDTree is not None and protein_coords.size else None
 
-    protein_atoms_by_token = [
-        atom_indices[protein_mask[atom_indices]]
-        for atom_indices in token_atoms
-    ]
-
-    group_weights = {
-        "base": float(config.base_weight),
-        "sugar": float(config.sugar_weight),
-        "phosphate": float(config.phosphate_weight),
-    }
     stats = {
         "n_token": int(n_token),
         "n_atom": int(n_atom),
         "n_protein_atom": int(protein_mask.sum()),
-        "n_rna_atom": int((is_rna & is_heavy & is_resolved).sum()),
+        "n_rna_atom": int((is_rna & is_heavy & is_resolved & distogram_rep_atom_mask).sum()),
         "n_rna_token": 0,
         "n_valid_rna_token": 0,
         "n_positive_rna_token": 0,
@@ -231,15 +208,19 @@ def compute_token_binding_signal(
             continue
         stats["n_rna_token"] += 1
 
-        rna_heavy_resolved = rna_atom_indices[is_heavy[rna_atom_indices] & is_resolved[rna_atom_indices]]
-        if rna_heavy_resolved.size == 0:
+        rna_rep_atoms = rna_atom_indices[
+            is_heavy[rna_atom_indices]
+            & is_resolved[rna_atom_indices]
+            & distogram_rep_atom_mask[rna_atom_indices]
+        ]
+        if rna_rep_atoms.size == 0:
             continue
         token_signal_mask[token_idx] = True
         token_resolved_mask[token_idx] = True
         stats["n_valid_rna_token"] += 1
 
         candidate_protein_tokens = _query_candidate_protein_tokens(
-            rna_coords=coords[rna_heavy_resolved],
+            rna_coords=coords[rna_rep_atoms],
             protein_coords=protein_coords,
             protein_atom_indices=protein_atom_indices,
             atom_to_token=atom_to_token,
@@ -251,27 +232,29 @@ def compute_token_binding_signal(
         if candidate_protein_tokens.size == 0:
             continue
 
-        rna_groups: dict[str, list[int]] = {"base": [], "sugar": [], "phosphate": []}
-        for atom_idx in rna_heavy_resolved:
-            rna_groups[_rna_atom_group(atom_names[atom_idx])].append(int(atom_idx))
-
         score = 0.0
+        rna_rep_coords = coords[rna_rep_atoms]
         for protein_token_idx in candidate_protein_tokens:
-            protein_token_atoms = protein_atoms_by_token[int(protein_token_idx)]
+            protein_token_atoms = token_atoms[int(protein_token_idx)]
+            protein_token_atoms = protein_token_atoms[protein_mask[protein_token_atoms]]
             if protein_token_atoms.size == 0:
                 continue
             protein_token_coords = coords[protein_token_atoms]
-            for group_name, group_atom_indices in rna_groups.items():
-                if not group_atom_indices:
-                    continue
-                distance = _min_distance(coords[np.asarray(group_atom_indices)], protein_token_coords)
-                if distance is None or distance > config.contact_radius:
-                    continue
-                score += group_weights[group_name] * _soft_contact(
+            distances = np.linalg.norm(
+                rna_rep_coords[:, None, :] - protein_token_coords[None, :, :],
+                axis=-1,
+            )
+            distance = float(distances.min())
+            if distance > config.contact_radius:
+                continue
+            score = max(
+                score,
+                _soft_contact(
                     distance=distance,
                     midpoint=config.contact_midpoint,
                     temperature=config.contact_temperature,
-                )
+                ),
+            )
         token_signal[token_idx] = np.float32(score)
 
     positive_mask = token_signal_mask & (token_signal > 0.0)
@@ -300,7 +283,8 @@ def add_signal_annotations(
         "signal_key": "token_array.rna_binding_signal",
         "signal_mask_key": "token_array.rna_binding_signal_mask",
         "resolved_mask_key": "token_array.rna_binding_resolved_mask",
-        "scoring": "sum_over_candidate_protein_tokens_groupwise_soft_contacts",
+        "distance_definition": "distogram_representative_atom_distance",
+        "scoring": "max_over_candidate_protein_tokens_soft_contact",
         **asdict(config),
         "stats": stats,
     }
@@ -411,12 +395,27 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--bioassembly-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--contact-radius", type=float, default=6.0)
-    parser.add_argument("--contact-midpoint", type=float, default=4.0)
+    parser.add_argument("--contact-radius", type=float, default=8.0)
+    parser.add_argument("--contact-midpoint", type=float, default=6.0)
     parser.add_argument("--contact-temperature", type=float, default=1.0)
-    parser.add_argument("--base-weight", type=float, default=1.0)
-    parser.add_argument("--sugar-weight", type=float, default=0.7)
-    parser.add_argument("--phosphate-weight", type=float, default=0.4)
+    parser.add_argument(
+        "--base-weight",
+        type=float,
+        default=1.0,
+        help="Deprecated no-op kept for compatibility with older groupwise scoring commands.",
+    )
+    parser.add_argument(
+        "--sugar-weight",
+        type=float,
+        default=0.7,
+        help="Deprecated no-op kept for compatibility with older groupwise scoring commands.",
+    )
+    parser.add_argument(
+        "--phosphate-weight",
+        type=float,
+        default=0.4,
+        help="Deprecated no-op kept for compatibility with older groupwise scoring commands.",
+    )
     parser.add_argument("--protein-atom-chunk-size", type=int, default=65536)
     parser.add_argument("--num-workers", type=int, default=1)
     parser.add_argument("--limit", type=int, default=None, help="Optional smoke-test cap.")
@@ -443,9 +442,6 @@ def main() -> None:
         contact_radius=args.contact_radius,
         contact_midpoint=args.contact_midpoint,
         contact_temperature=args.contact_temperature,
-        base_weight=args.base_weight,
-        sugar_weight=args.sugar_weight,
-        phosphate_weight=args.phosphate_weight,
         protein_atom_chunk_size=args.protein_atom_chunk_size,
     )
     files = list_input_files(args.bioassembly_dir, args.limit)
@@ -497,3 +493,11 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+"""
+python scripts/add_structure_rna_signal_to_protenix_pkl.py \
+    --bioassembly-dir /inspire/ssd/project/sais-bio/public/xiangwenkai/GITHUB/Protenix_v1/data/train \
+    --output-dir /inspire/ssd/project/sais-bio/public/xiangwenkai/GITHUB/Protenix_v1/data/train_signal \
+    --num-workers 16 \
+    --overwrite
+"""

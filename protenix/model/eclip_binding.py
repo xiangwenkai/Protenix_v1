@@ -260,7 +260,6 @@ class EclipSignalLoss(nn.Module):
         profile_pass = raw_signal.max() >= float(self.min_height)
         profile_pass_bool = bool(profile_pass.detach().item())
         pred_logits = valid_p.log()
-        pred_profile = torch.softmax(pred_logits.float(), dim=-1)
         if profile_pass_bool:
             profile_loss = -torch.distributions.Multinomial(
                 logits=pred_logits.float(),
@@ -271,47 +270,89 @@ class EclipSignalLoss(nn.Module):
 
         weighted_profile_loss = self.profile_weight * profile_loss
         loss = weighted_profile_loss
-        target_bind = (raw_signal >= float(self.binary_threshold)).to(dtype=valid_p.dtype)
         metrics = {
             "loss": loss.detach(),
             "profile_multinomial_nll": profile_loss.detach(),
             "weighted_profile_multinomial_nll": weighted_profile_loss.detach(),
-            "profile_min_height_pass": torch.as_tensor(
-                float(profile_pass_bool),
-                device=p_bind.device,
-                dtype=torch.float32,
-            ),
-            "profile_pcc": masked_pearson(
-                pred_profile,
-                valid_signal,
-                torch.ones_like(valid_signal, dtype=torch.bool),
-                eps=self.eps,
-            ),
-            "profile_auprc": binary_auprc(
-                valid_p,
-                valid_signal,
-                torch.ones_like(valid_signal, dtype=torch.bool),
-                threshold=float(self.binary_threshold),
-            ),
-            "p_bind_mean": valid_p.detach().mean(),
-            "target_signal_sum": raw_signal.detach().sum(),
-            "loss_signal_sum": loss_signal.detach().sum(),
-            "loss_signal_clip_value": torch.as_tensor(
-                float(self.signal_clip_value),
-                device=p_bind.device,
-                dtype=torch.float32,
-            ),
-            "loss_signal_max_total": torch.as_tensor(
-                float(self.max_total_count),
-                device=p_bind.device,
-                dtype=torch.float32,
-            ),
-            "target_positive_sum": target_bind.detach().sum(),
-            "target_positive_rate": target_bind.detach().mean(),
-            "target_signal_peak": raw_signal.detach().max(),
-            "loss_signal_peak": loss_signal.detach().max(),
         }
         return loss, metrics
+
+
+class StructureSignalKLLoss(nn.Module):
+    """KL loss for structure-derived soft RNA contact profiles.
+
+    The PDB target signal is a bounded soft contact score, not a count profile.
+    Both prediction and target are therefore normalized over valid RNA tokens
+    before computing KL(target || prediction).
+    """
+
+    def __init__(
+        self,
+        *,
+        profile_weight: float = 1.0,
+        target_threshold: float = 0.0,
+        min_peak: float = 0.0,
+        binary_threshold: float = 0.5,
+        eps: float = 1e-8,
+    ) -> None:
+        super().__init__()
+        self.profile_weight = profile_weight
+        self.target_threshold = target_threshold
+        self.min_peak = min_peak
+        self.binary_threshold = binary_threshold
+        self.eps = eps
+
+    def forward(
+        self,
+        p_bind: torch.Tensor,
+        target_signal: torch.Tensor,
+        target_mask: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        if p_bind.ndim > 1 and p_bind.shape[0] == 1:
+            p_bind = p_bind.squeeze(0)
+        p_bind = p_bind.float()
+        target_signal = target_signal.to(device=p_bind.device, dtype=torch.float32)
+        if target_mask is None:
+            target_mask = torch.ones_like(p_bind, dtype=torch.bool)
+        else:
+            target_mask = target_mask.to(device=p_bind.device, dtype=torch.bool)
+
+        valid_p = p_bind[target_mask].clamp_min(self.eps)
+        raw_signal = target_signal[target_mask].clamp_min(0.0)
+        if valid_p.numel() == 0:
+            zero = p_bind.sum() * 0.0
+            return zero, {"loss": zero.detach()}
+
+        target_threshold = float(self.target_threshold)
+        filtered_signal = torch.where(
+            raw_signal >= target_threshold,
+            raw_signal,
+            torch.zeros_like(raw_signal),
+        )
+        target_sum = filtered_signal.sum()
+        raw_peak = raw_signal.max()
+        filter_pass = (raw_peak >= float(self.min_peak)) & (target_sum > self.eps)
+        filter_pass_bool = bool(filter_pass.detach().item())
+
+        pred_profile = valid_p / valid_p.sum().clamp_min(self.eps)
+        if filter_pass_bool:
+            target_profile = filtered_signal / target_sum.clamp_min(self.eps)
+            kl_loss = torch.nn.functional.kl_div(
+                pred_profile.clamp_min(self.eps).log(),
+                target_profile,
+                reduction="sum",
+            )
+        else:
+            target_profile = torch.zeros_like(filtered_signal)
+            kl_loss = pred_profile.sum() * 0.0
+
+        weighted_kl_loss = self.profile_weight * kl_loss
+        metrics = {
+            "loss": weighted_kl_loss.detach(),
+            "profile_kl": kl_loss.detach(),
+            "weighted_profile_kl": weighted_kl_loss.detach(),
+        }
+        return weighted_kl_loss, metrics
 
 
 class EclipBindingScorer(nn.Module):
