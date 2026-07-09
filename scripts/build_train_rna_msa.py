@@ -39,6 +39,19 @@ from runner.rna_msa_search import run_rna_msa_search
 
 LOGGER = logging.getLogger("build_train_rna_msa")
 RNA_ALPHABET = set("AUGCN")
+SEARCH_DATABASE_DIR = Path(
+    "/inspire/ssd/project/sais-bio/public/Protein/data/AI_Models/"
+    "protenix_v1_dataset/search_database"
+)
+NTRNA_DATABASE_PATH = (
+    SEARCH_DATABASE_DIR / "nt_rna_2023_02_23_clust_seq_id_90_cov_80_rep_seq.fasta"
+)
+RFAM_DATABASE_PATH = (
+    SEARCH_DATABASE_DIR / "rfam_14_9_clust_seq_id_90_cov_80_rep_seq.fasta"
+)
+RNA_CENTRAL_DATABASE_PATH = (
+    SEARCH_DATABASE_DIR / "rnacentral_active_seq_id_90_cov_80_linclust.fasta"
+)
 
 
 @dataclass(frozen=True)
@@ -95,7 +108,8 @@ def parse_args() -> argparse.Namespace:
             "Search missing RNA MSAs for a Protenix training indices CSV. "
             "Existing Protenix RNA MSAs are reused; only missing sequences are "
             "searched and written to an extra training-compatible RNA MSA cache."
-        )
+        ),
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
         "--indices-csv",
@@ -141,9 +155,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--nhmmer-binary-path", type=str, default=None)
     parser.add_argument("--hmmalign-binary-path", type=str, default=None)
     parser.add_argument("--hmmbuild-binary-path", type=str, default=None)
-    parser.add_argument("--ntrna-database-path", type=str, default=None)
-    parser.add_argument("--rfam-database-path", type=str, default=None)
-    parser.add_argument("--rna-central-database-path", type=str, default=None)
+    parser.add_argument(
+        "--ntrna-database-path",
+        type=str,
+        default=str(NTRNA_DATABASE_PATH),
+        help="NT-RNA FASTA database path.",
+    )
+    parser.add_argument(
+        "--rfam-database-path",
+        type=str,
+        default=str(RFAM_DATABASE_PATH),
+        help="Rfam RNA FASTA database path.",
+    )
+    parser.add_argument(
+        "--rna-central-database-path",
+        type=str,
+        default=str(RNA_CENTRAL_DATABASE_PATH),
+        help="RNAcentral FASTA database path.",
+    )
     parser.add_argument(
         "--limit",
         type=int,
@@ -424,12 +453,31 @@ def collect_used_ids(
     return used_ids
 
 
+def validate_database_paths(args: argparse.Namespace) -> None:
+    database_paths = {
+        "ntrna_database_path": args.ntrna_database_path,
+        "rfam_database_path": args.rfam_database_path,
+        "rna_central_database_path": args.rna_central_database_path,
+    }
+    missing = [
+        f"{name}={path}"
+        for name, path in database_paths.items()
+        if not Path(path).exists()
+    ]
+    if missing:
+        raise FileNotFoundError(
+            "RNA MSA database file(s) not found. Refusing to fall back to "
+            "runner/rna_msa_search.py auto-download behavior: " + "; ".join(missing)
+        )
+
+
 def main() -> None:
     args = parse_args()
     logging.basicConfig(
         level=getattr(logging, args.log_level),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    validate_database_paths(args)
 
     existing_maps = args.existing_map or default_existing_maps()
     existing_roots = args.existing_root or default_existing_roots()
@@ -457,6 +505,9 @@ def main() -> None:
     n_failed = 0
 
     LOGGER.info("indices_csv=%s", args.indices_csv)
+    LOGGER.info("ntrna_database_path=%s", args.ntrna_database_path)
+    LOGGER.info("rfam_database_path=%s", args.rfam_database_path)
+    LOGGER.info("rna_central_database_path=%s", args.rna_central_database_path)
     LOGGER.info("unique RNA sequences=%d", len(entries))
     LOGGER.info("output_root=%s", args.output_root)
 
