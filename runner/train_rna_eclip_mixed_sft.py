@@ -341,6 +341,9 @@ class RNAEclipMixedSFTTrainer:
         self.iters_to_accumulate = self.configs.iters_to_accumulate
         self.best_eval_loss = float("inf")
         self.best_eval_step = -1
+        self.best_checkpoint_score = -float("inf")
+        self.best_checkpoint_metric = ""
+        self.best_checkpoint_mode = ""
 
         self.run_name = self.configs.run_name + "_" + time.strftime("%Y%m%d_%H%M%S")
         run_names = DIST_WRAPPER.all_gather_object(
@@ -548,23 +551,50 @@ class RNAEclipMixedSFTTrainer:
                 self.global_step = self.step * self.iters_to_accumulate
             self.best_eval_loss = float(checkpoint.get("best_eval_loss", self.best_eval_loss))
             self.best_eval_step = int(checkpoint.get("best_eval_step", self.best_eval_step))
+            if "best_checkpoint_score" in checkpoint:
+                self.best_checkpoint_score = float(checkpoint["best_checkpoint_score"])
+            elif "best_eval_loss" in checkpoint:
+                self.best_checkpoint_score = -float(checkpoint["best_eval_loss"])
+            self.best_checkpoint_metric = str(
+                checkpoint.get("best_checkpoint_metric", self.best_checkpoint_metric)
+            )
+            self.best_checkpoint_mode = str(
+                checkpoint.get("best_checkpoint_mode", self.best_checkpoint_mode)
+            )
         self.print(f"Loaded checkpoint {checkpoint_path} at step {self.step}")
 
-    def save_checkpoint(self, filename: str | None = None) -> None:
+    def save_checkpoint(
+        self,
+        filename: str | None = None,
+        save_training_state: bool | None = None,
+    ) -> None:
         if DIST_WRAPPER.rank != 0:
             return
+        if save_training_state is None:
+            save_training_state = bool(self.mixed_cfg.save_training_state)
         path = self.checkpoint_dir / (filename or f"{self.step}.pt")
         checkpoint = {
             "model": _module_state_dict(self.raw_model),
-            "optimizer": self.optimizer.state_dict(),
-            "scheduler": self.lr_scheduler.state_dict() if self.lr_scheduler else None,
-            "step": self.step,
-            "best_eval_loss": self.best_eval_loss,
-            "best_eval_step": self.best_eval_step,
-            "config": dict(self.configs),
         }
+        if save_training_state:
+            checkpoint.update(
+                {
+                    "optimizer": self.optimizer.state_dict(),
+                    "scheduler": (
+                        self.lr_scheduler.state_dict() if self.lr_scheduler else None
+                    ),
+                    "step": self.step,
+                    "best_eval_loss": self.best_eval_loss,
+                    "best_eval_step": self.best_eval_step,
+                    "best_checkpoint_score": self.best_checkpoint_score,
+                    "best_checkpoint_metric": self.best_checkpoint_metric,
+                    "best_checkpoint_mode": self.best_checkpoint_mode,
+                    "config": dict(self.configs),
+                }
+            )
         torch.save(checkpoint, path)
-        self.print(f"Saved checkpoint to {path}")
+        state_kind = "training-state" if save_training_state else "model-only"
+        self.print(f"Saved {state_kind} checkpoint to {path}")
 
     def print(self, msg: str) -> None:
         if DIST_WRAPPER.rank == 0:
@@ -841,6 +871,11 @@ class RNAEclipMixedSFTTrainer:
             evaluated_pids = []
             total_batch_num = len(test_dl)
             for index, batch in enumerate(tqdm(test_dl, disable=DIST_WRAPPER.rank != 0)):
+                if (
+                    self.mixed_cfg.pdb_eval_max_steps is not None
+                    and index >= int(self.mixed_cfg.pdb_eval_max_steps)
+                ):
+                    break
                 batch = to_device(batch, self.device)
                 pid = batch["basic"]["pdb_id"]
                 if index + 1 == total_batch_num and DIST_WRAPPER.world_size > 1:
@@ -902,11 +937,34 @@ class RNAEclipMixedSFTTrainer:
                         )
         return metric_wrapper.calc()
 
+    def evaluate_foldbench(self) -> dict[str, float]:
+        fold_cfg = getattr(self.configs, "foldbench_eval", None)
+        if fold_cfg is None or not fold_cfg.enable:
+            return {}
+        from protenix.eval.foldbench_validation import run_foldbench_validation
+
+        self.print(f"Running FoldBench validation at step {self.step}")
+        try:
+            return run_foldbench_validation(
+                model=self.raw_model,
+                train_configs=self.configs,
+                fold_cfg=fold_cfg,
+                run_dir=self.run_dir,
+                step=self.step,
+                device=self.device,
+            )
+        except Exception:
+            if self.use_ddp:
+                raise
+            self.print(f"FoldBench validation failed:\n{traceback.format_exc()}")
+            return {"foldbench/failed": 1.0}
+
     @torch.no_grad()
     def evaluate(self) -> dict[str, float]:
         metrics = {}
         metrics.update(self.evaluate_pdb())
         metrics.update(self.evaluate_eclip())
+        metrics.update(self.evaluate_foldbench())
         eval_loss_values = [
             float(value) for key, value in metrics.items() if key.endswith("/loss.avg")
         ]
@@ -919,17 +977,105 @@ class RNAEclipMixedSFTTrainer:
             wandb.log(metrics, step=self.step)
         return metrics
 
+    def _metric_mode(self, metric_name: str, requested_mode: str) -> str:
+        requested_mode = str(requested_mode).lower()
+        if requested_mode in ("max", "min"):
+            return requested_mode
+        lower_name = metric_name.lower()
+        if "loss" in lower_name or lower_name.endswith("irmsd") or lower_name.endswith("lrmsd"):
+            return "min"
+        return "max"
+
+    def _mean_metric_by_suffix(
+        self,
+        metrics: dict[str, float],
+        suffix: str,
+    ) -> tuple[str, float] | None:
+        matched = [
+            (key, float(value))
+            for key, value in metrics.items()
+            if key.endswith(suffix)
+        ]
+        if not matched:
+            return None
+        if len(matched) == 1:
+            return matched[0]
+        value = sum(value for _, value in matched) / len(matched)
+        return f"mean(*{suffix})", value
+
+    def _resolve_structure_best_metric(
+        self,
+        metrics: dict[str, float],
+    ) -> tuple[str, float, str] | None:
+        for key in ("foldbench/lddt", "foldbench/dockq_score_success_rate"):
+            if key in metrics:
+                return key, float(metrics[key]), "max"
+
+        for suffix in (
+            "/pdb/lddt/complex/ranking_score.rank1.avg",
+            "/pdb/lddt/complex/plddt.rank1.avg",
+            "/pdb/lddt/complex/gpde.rank1.avg",
+            "/pdb/lddt/complex/best.avg",
+        ):
+            resolved = self._mean_metric_by_suffix(metrics, suffix)
+            if resolved is not None:
+                key, value = resolved
+                return key, value, "max"
+
+        if "eval/loss.avg" in metrics:
+            return "eval/loss.avg", float(metrics["eval/loss.avg"]), "min"
+        return None
+
+    def _resolve_best_checkpoint_metric(
+        self,
+        metrics: dict[str, float],
+    ) -> tuple[str, float, str] | None:
+        requested_metric = str(self.mixed_cfg.best_metric)
+        requested_mode = str(self.mixed_cfg.best_metric_mode)
+        if requested_metric == "structure":
+            return self._resolve_structure_best_metric(metrics)
+
+        if requested_metric in metrics:
+            mode = self._metric_mode(requested_metric, requested_mode)
+            return requested_metric, float(metrics[requested_metric]), mode
+
+        suffix_matches = [
+            (key, float(value))
+            for key, value in metrics.items()
+            if key.endswith(requested_metric)
+        ]
+        if suffix_matches:
+            mode = self._metric_mode(requested_metric, requested_mode)
+            if len(suffix_matches) == 1:
+                key, value = suffix_matches[0]
+                return key, value, mode
+            value = sum(value for _, value in suffix_matches) / len(suffix_matches)
+            return f"mean(*{requested_metric})", value, mode
+
+        self.print(
+            f"Best checkpoint metric {requested_metric!r} not found. "
+            f"Available metric keys: {sorted(metrics.keys())}"
+        )
+        return None
+
     def save_best_eval_checkpoint(self, metrics: dict[str, float]) -> None:
-        eval_loss = metrics.get("eval/loss.avg")
-        if eval_loss is None:
+        resolved = self._resolve_best_checkpoint_metric(metrics)
+        if resolved is None:
             return
-        eval_loss = float(eval_loss)
-        if eval_loss >= self.best_eval_loss:
+        metric_name, metric_value, metric_mode = resolved
+        checkpoint_score = metric_value if metric_mode == "max" else -metric_value
+        if checkpoint_score <= self.best_checkpoint_score:
             return
-        self.best_eval_loss = eval_loss
+        self.best_checkpoint_score = checkpoint_score
+        self.best_checkpoint_metric = metric_name
+        self.best_checkpoint_mode = metric_mode
+        if metric_mode == "min":
+            self.best_eval_loss = metric_value
         self.best_eval_step = self.step
         self.print(
-            f"New best eval loss {self.best_eval_loss:.6f} at step {self.best_eval_step}"
+            "New best checkpoint metric "
+            f"{metric_name}={metric_value:.6f} ({metric_mode}) "
+            f"at step {self.best_eval_step}"
         )
         self.save_checkpoint("best_eval.pt")
 

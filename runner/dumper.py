@@ -21,6 +21,10 @@ import torch
 from biotite.structure import AtomArray
 
 from protenix.data.utils import save_structure_cif
+from protenix.model.eclip_binding import (
+    compute_distogram_binding_score,
+    get_protein_token_indices,
+)
 from protenix.utils.file_io import save_json
 from protenix.utils.torch_utils import round_values
 
@@ -53,6 +57,7 @@ class DataDumper:
         base_dir (str): Base directory for saving dumped data.
         need_atom_confidence (bool): Whether to save detailed atom-level confidence data.
         sorted_by_ranking_score (bool): Whether to sort output files by ranking score.
+        dump_contact_probs (bool): Whether to save RNA-protein contact sidecars.
     """
 
     def __init__(
@@ -60,10 +65,12 @@ class DataDumper:
         base_dir: str,
         need_atom_confidence: bool = False,
         sorted_by_ranking_score: bool = True,
+        dump_contact_probs: bool = False,
     ) -> None:
         self.base_dir = base_dir
         self.need_atom_confidence = need_atom_confidence
         self.sorted_by_ranking_score = sorted_by_ranking_score
+        self.dump_contact_probs = dump_contact_probs
 
     def dump(
         self,
@@ -73,6 +80,7 @@ class DataDumper:
         pred_dict: dict,
         atom_array: AtomArray,
         entity_poly_type: dict[str, str],
+        input_feature_dict: Optional[dict[str, torch.Tensor]] = None,
     ):
         """
         Dump the predictions and related data to the specified directory.
@@ -84,6 +92,8 @@ class DataDumper:
             pred_dict (dict): The dictionary containing the predictions.
             atom_array (AtomArray): The AtomArray object containing the structure data.
             entity_poly_type (dict[str, str]): The entity poly type information.
+            input_feature_dict (Optional[dict[str, torch.Tensor]]): Input features used
+                to compute optional RNA-protein contact sidecars.
         """
         dump_dir = self._get_dump_dir(dataset_name, pdb_id, seed)
         Path(dump_dir).mkdir(parents=True, exist_ok=True)
@@ -95,6 +105,7 @@ class DataDumper:
             atom_array=atom_array,
             entity_poly_type=entity_poly_type,
             seed=seed,
+            input_feature_dict=input_feature_dict,
         )
 
     def _get_dump_dir(self, dataset_name: str, sample_name: str, seed: int) -> str:
@@ -115,6 +126,7 @@ class DataDumper:
         atom_array: AtomArray,
         entity_poly_type: dict[str, str],
         seed: int,
+        input_feature_dict: Optional[dict[str, torch.Tensor]] = None,
     ):
         """
         Dump raw predictions from the model.
@@ -126,6 +138,8 @@ class DataDumper:
             atom_array (AtomArray): Reference atom array for structure formatting.
             entity_poly_type (dict[str, str]): Dictionary mapping entity IDs to their polymer types.
             seed (int): Random seed used for the prediction.
+            input_feature_dict (Optional[dict[str, torch.Tensor]]): Input features used
+                to compute optional RNA-protein contact sidecars.
         """
         prediction_save_dir = os.path.join(dump_dir, "predictions")
         os.makedirs(prediction_save_dir, exist_ok=True)
@@ -164,6 +178,14 @@ class DataDumper:
             seed=seed,
             sorted_indices=sorted_indices,
         )
+        if self.dump_contact_probs:
+            self._save_contact_sidecars(
+                data=pred_dict,
+                input_feature_dict=input_feature_dict,
+                prediction_save_dir=prediction_save_dir,
+                sample_name=pdb_id,
+                sorted_indices=sorted_indices,
+            )
 
     def _save_structure(
         self,
@@ -273,3 +295,52 @@ class DataDumper:
                     f"{sample_name}_full_data_sample_{rank}.json",
                 )
                 save_json(data["full_data"][idx], output_fpath, indent=None)
+
+    def _save_contact_sidecars(
+        self,
+        data: dict,
+        input_feature_dict: Optional[dict[str, torch.Tensor]],
+        prediction_save_dir: str,
+        sample_name: str,
+        sorted_indices: Optional[List[int]],
+    ) -> None:
+        """Save per-RNA-token protein-binding probabilities from contact_probs."""
+        if input_feature_dict is None or "contact_probs" not in data:
+            return
+
+        try:
+            contact_probs = data.get("per_sample_contact_probs", data["contact_probs"])
+            p_bind, rna_token_indices = compute_distogram_binding_score(
+                contact_probs=contact_probs,
+                feat_dict=input_feature_dict,
+            )
+            protein_token_indices = get_protein_token_indices(input_feature_dict)
+        except (KeyError, ValueError):
+            return
+
+        N_sample = len(data["summary_confidence"])
+        if sorted_indices is None:
+            sorted_indices = list(range(N_sample))
+
+        for idx, rank in enumerate(sorted_indices):
+            cur_p_bind = p_bind
+            if cur_p_bind.ndim > 1:
+                cur_idx = idx if idx < cur_p_bind.shape[0] else 0
+                cur_p_bind = cur_p_bind[cur_idx]
+
+            output_fpath = os.path.join(
+                prediction_save_dir,
+                f"{sample_name}_p_bind_sample_{rank}.npz",
+            )
+            np.savez_compressed(
+                output_fpath,
+                p_bind=cur_p_bind.detach().float().cpu().numpy().astype(np.float32),
+                rna_token_indices=rna_token_indices.detach()
+                .cpu()
+                .numpy()
+                .astype(np.int64),
+                protein_token_indices=protein_token_indices.detach()
+                .cpu()
+                .numpy()
+                .astype(np.int64),
+            )

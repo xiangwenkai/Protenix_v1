@@ -51,7 +51,7 @@ eclip_ppft_configs = {
         "signal_profile_weight": 1.0,
         "signal_multinomial_min_height": 3.0,
         "signal_binary_threshold": 2.0,
-        "signal_clip_value": 100.0,
+        "signal_clip_value": 30.0,
         "signal_multinomial_max_total": 100.0,
         "signal_loss_weight": 0.05,
         "confidence_quality_weight": 0.2,

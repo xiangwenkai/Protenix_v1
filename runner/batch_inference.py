@@ -300,7 +300,10 @@ def get_default_runner(
     use_rna_msa: bool = False,
     use_seeds_in_json: bool = False,
     need_atom_confidence: bool = False,
+    dump_contact_probs: bool = False,
     kalign_binary_path: Optional[str] = None,
+    allow_duplicate_query_templates: bool = False,
+    prefer_similar_templates: bool = False,
 ) -> InferenceRunner:
     """
     Get a default InferenceRunner with the specified configurations.
@@ -321,7 +324,10 @@ def get_default_runner(
         use_template (bool): Whether to use templates.
         use_rna_msa (bool): Whether to use RNA MSA.
         use_seeds_in_json (bool): Whether to use seeds defined in the JSON file.
+        dump_contact_probs (bool): Whether to save RNA-protein contact probability sidecars.
         kalign_binary_path (Optional[str]): Path to kalign binary.
+        allow_duplicate_query_templates (bool): Allow self/near-self templates for inference.
+        prefer_similar_templates (bool): Rank templates by sequence similarity instead of raw sum_probs.
 
     Returns:
         InferenceRunner: An instance of InferenceRunner.
@@ -364,6 +370,34 @@ def get_default_runner(
     configs.use_rna_msa = use_rna_msa
     configs.use_seeds_in_json = use_seeds_in_json
     configs.need_atom_confidence = need_atom_confidence
+    configs.dump_contact_probs = dump_contact_probs
+    if use_template:
+        protenix_root_dir = os.environ.get("PROTENIX_ROOT_DIR", str(Path.home()))
+        configs.data.template.enable_prot_template = True
+        configs.data.template.prot_template_mmcif_dir = configs.data.template.get(
+            "prot_template_mmcif_dir",
+            os.path.join(protenix_root_dir, "mmcif"),
+        ) or os.path.join(protenix_root_dir, "mmcif")
+        configs.data.template.prot_template_cache_dir = configs.data.template.get(
+            "prot_template_cache_dir",
+            os.path.join(protenix_root_dir, "template_cache"),
+        ) or os.path.join(protenix_root_dir, "template_cache")
+        configs.data.template.release_dates_path = configs.data.template.get(
+            "release_dates_path",
+            os.path.join(protenix_root_dir, "common", "release_date_cache.json"),
+        ) or os.path.join(protenix_root_dir, "common", "release_date_cache.json")
+        configs.data.template.obsolete_pdbs_path = configs.data.template.get(
+            "obsolete_pdbs_path",
+            os.path.join(protenix_root_dir, "common", "obsolete_to_successor.json"),
+        ) or os.path.join(protenix_root_dir, "common", "obsolete_to_successor.json")
+        configs.data.template.fetch_remote = configs.data.template.get(
+            "fetch_remote",
+            False,
+        )
+        configs.data.template.allow_duplicate_query_templates = (
+            allow_duplicate_query_templates
+        )
+        configs.data.template.prefer_similar_templates = prefer_similar_templates
     if kalign_binary_path is not None:
         # The path provided by the user is expected to exist by default
         configs.data.template.kalign_binary_path = kalign_binary_path
@@ -438,7 +472,10 @@ def inference_jsons(
     use_rna_msa: bool = False,
     use_seeds_in_json: bool = False,
     need_atom_confidence: bool = False,
+    dump_contact_probs: bool = False,
     kalign_binary_path: Optional[str] = None,
+    allow_duplicate_query_templates: bool = False,
+    prefer_similar_templates: bool = False,
     hmmsearch_binary_path: Optional[str] = None,
     hmmbuild_binary_path: Optional[str] = None,
     seqres_database_path: Optional[str] = None,
@@ -472,7 +509,10 @@ def inference_jsons(
         use_template (bool): Whether to use templates.
         use_rna_msa (bool): Whether to use RNA MSA.
         use_seeds_in_json (bool): Whether to use seeds from JSON.
+        dump_contact_probs (bool): Whether to save RNA-protein contact probability sidecars.
         kalign_binary_path (Optional[str]): Path to kalign binary.
+        allow_duplicate_query_templates (bool): Allow self/near-self templates.
+        prefer_similar_templates (bool): Prefer templates with highest sequence similarity.
         hmmsearch_binary_path (Optional[str]): Path to hmmsearch binary.
         hmmbuild_binary_path (Optional[str]): Path to hmmbuild binary.
         seqres_database_path (Optional[str]): Path to sequence database.
@@ -486,9 +526,9 @@ def inference_jsons(
     """
     infer_jsons = []
     if os.path.isdir(json_file):
-        infer_jsons = [
+        infer_jsons = sorted(
             str(file) for file in Path(json_file).rglob("*") if file.is_file()
-        ]
+        )
         if len(infer_jsons) == 0:
             raise RuntimeError(f"Can not read a valid json file in {json_file}")
     elif os.path.isfile(json_file):
@@ -519,7 +559,10 @@ def inference_jsons(
         use_rna_msa=use_rna_msa,
         use_seeds_in_json=use_seeds_in_json,
         need_atom_confidence=need_atom_confidence,
+        dump_contact_probs=dump_contact_probs,
         kalign_binary_path=kalign_binary_path,
+        allow_duplicate_query_templates=allow_duplicate_query_templates,
+        prefer_similar_templates=prefer_similar_templates,
     )
     configs = runner.configs
     for _, infer_json in enumerate(tqdm.tqdm(infer_jsons)):
@@ -676,10 +719,28 @@ def protenix_cli() -> None:
     help="Whether to compute atom-level confidence scores.",
 )
 @click.option(
+    "--dump_contact_probs",
+    type=bool,
+    default=False,
+    help="Whether to save RNA-protein contact probability sidecars.",
+)
+@click.option(
     "--kalign_binary_path",
     type=str,
     default=None,
     help="Path to kalign (searches in PATH if not provided).",
+)
+@click.option(
+    "--allow_duplicate_query_templates",
+    type=bool,
+    default=False,
+    help="Allow self/near-self templates. Default keeps original Protenix behavior.",
+)
+@click.option(
+    "--prefer_similar_templates",
+    type=bool,
+    default=False,
+    help="Prefer sequence-similar templates instead of original sum_probs ranking.",
 )
 @click.option(
     "--hmmsearch_binary_path",
@@ -762,7 +823,10 @@ def predict(
     use_rna_msa: bool,
     use_seeds_in_json: bool,
     need_atom_confidence: bool,
+    dump_contact_probs: bool,
     kalign_binary_path: Optional[str] = None,
+    allow_duplicate_query_templates: bool = False,
+    prefer_similar_templates: bool = False,
     hmmsearch_binary_path: Optional[str] = None,
     hmmbuild_binary_path: Optional[str] = None,
     seqres_database_path: Optional[str] = None,
@@ -798,7 +862,10 @@ def predict(
         use_rna_msa (bool): Use RNA MSA.
         use_seeds_in_json (bool): Use seeds from JSON.
         need_atom_confidence (bool): Compute atom-level confidence scores.
+        dump_contact_probs (bool): Save RNA-protein contact probability sidecars.
         kalign_binary_path (Optional[str]): Path to kalign binary.
+        allow_duplicate_query_templates (bool): Allow self/near-self templates.
+        prefer_similar_templates (bool): Prefer sequence-similar templates.
         hmmsearch_binary_path (Optional[str]): Path to hmmsearch binary.
         hmmbuild_binary_path (Optional[str]): Path to hmmbuild binary.
         seqres_database_path (Optional[str]): Path to sequence database.
@@ -911,7 +978,10 @@ def predict(
         use_rna_msa=use_rna_msa,
         use_seeds_in_json=use_seeds_in_json,
         need_atom_confidence=need_atom_confidence,
+        dump_contact_probs=dump_contact_probs,
         kalign_binary_path=kalign_binary_path,
+        allow_duplicate_query_templates=allow_duplicate_query_templates,
+        prefer_similar_templates=prefer_similar_templates,
         hmmsearch_binary_path=hmmsearch_binary_path,
         hmmbuild_binary_path=hmmbuild_binary_path,
         seqres_database_path=seqres_database_path,

@@ -108,6 +108,8 @@ def run_gen_data(
     cluster_file: Optional[Path],
     distillation: bool = False,
     num_workers: int = 1,
+    max_file_size_mb: Optional[float] = None,
+    skipped_files_txt: Optional[Path] = None,
 ):
     """
     Generates data from MMCIF files and saves the output to specified locations.
@@ -119,6 +121,8 @@ def run_gen_data(
         cluster_file (Optional[str]): Path to the cluster file, if any.
         distillation (bool, optional): Flag indicating whether to use the 'Distillation' setting. Defaults to False.
         num_workers (int, optional): Number of worker processes to use. Defaults to 1.
+        max_file_size_mb (float, optional): Skip mmCIF files larger than this size in MiB.
+        skipped_files_txt (Path, optional): Path to save skipped mmCIF file paths.
 
     Raises:
         NotImplementedError: If the input path is not a directory or a text file.
@@ -136,9 +140,37 @@ def run_gen_data(
         mmcif_list = list(input_path.glob("*.cif")) + list(input_path.glob("*.cif.gz"))
     elif input_path.suffix == ".txt":
         with open(input_path) as f:
-            mmcif_list = [i.strip() for i in f.readlines()]
+            mmcif_list = [Path(i.strip()) for i in f.readlines() if i.strip()]
     else:
         raise NotImplementedError(f"Unsupported input path: {input_path}")
+
+    if max_file_size_mb is not None:
+        max_file_size_bytes = max_file_size_mb * 1024 * 1024
+        kept_mmcifs = []
+        skipped_mmcifs = []
+        for mmcif in mmcif_list:
+            file_size = Path(mmcif).stat().st_size
+            if file_size > max_file_size_bytes:
+                skipped_mmcifs.append(Path(mmcif))
+            else:
+                kept_mmcifs.append(Path(mmcif))
+        mmcif_list = kept_mmcifs
+        print(
+            f"Skip {len(skipped_mmcifs)} mmCIF files larger than "
+            f"{max_file_size_mb:g} MiB; keep {len(mmcif_list)} files.",
+            flush=True,
+        )
+        if skipped_files_txt is not None:
+            skipped_files_txt = Path(skipped_files_txt)
+            skipped_files_txt.parent.mkdir(parents=True, exist_ok=True)
+            skipped_files_txt.write_text(
+                "\n".join(str(i) for i in skipped_mmcifs) + ("\n" if skipped_mmcifs else "")
+            )
+            print(f"Skipped file list written to {skipped_files_txt}", flush=True)
+        elif skipped_mmcifs:
+            preview = ", ".join(str(i) for i in skipped_mmcifs[:20])
+            suffix = " ..." if len(skipped_mmcifs) > 20 else ""
+            print(f"Skipped files: {preview}{suffix}", flush=True)
 
     gen_data_from_mmcifs(
         mmcif_list,
@@ -195,6 +227,18 @@ if __name__ == "__main__":
         default=1,
         help="Number of worker processes to use. Defaults to 1.",
     )
+    parser.add_argument(
+        "--max_file_size_mb",
+        type=float,
+        default=None,
+        help="Skip mmCIF files larger than this size in MiB. Defaults to no size filter.",
+    )
+    parser.add_argument(
+        "--skipped_files_txt",
+        type=Path,
+        default=None,
+        help="Optional path to save skipped mmCIF file paths.",
+    )
 
     args = parser.parse_args()
 
@@ -205,4 +249,6 @@ if __name__ == "__main__":
         cluster_file=args.cluster_file,
         distillation=args.distillation,
         num_workers=args.n_cpu,
+        max_file_size_mb=args.max_file_size_mb,
+        skipped_files_txt=args.skipped_files_txt,
     )

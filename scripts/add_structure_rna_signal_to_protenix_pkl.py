@@ -26,7 +26,6 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import math
 import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
@@ -48,9 +47,10 @@ LOGGER = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class SignalConfig:
-    contact_radius: float = 8.0
-    contact_midpoint: float = 6.0
-    contact_temperature: float = 1.0
+    contact_threshold: float = 8.0
+    distogram_min_bin: float = 2.3125
+    distogram_max_bin: float = 21.6875
+    distogram_no_bins: int = 64
     protein_atom_chunk_size: int = 65536
 
 
@@ -67,13 +67,49 @@ def _is_heavy_atom_array(atom_array: Any) -> np.ndarray:
     return np.where(has_element, heavy_by_element, heavy_by_name)
 
 
-def _soft_contact(distance: float, midpoint: float, temperature: float) -> float:
-    x = (midpoint - distance) / max(float(temperature), 1e-6)
-    if x >= 50:
-        return 1.0
-    if x <= -50:
-        return 0.0
-    return 1.0 / (1.0 + math.exp(-x))
+def _distogram_bin_centers(config: SignalConfig) -> np.ndarray:
+    bin_width = (float(config.distogram_max_bin) - float(config.distogram_min_bin)) / int(
+        config.distogram_no_bins
+    )
+    boundaries = np.linspace(
+        start=float(config.distogram_min_bin),
+        stop=float(config.distogram_max_bin) - bin_width,
+        num=int(config.distogram_no_bins),
+        dtype=np.float32,
+    )
+    return boundaries + np.float32(0.5 * bin_width)
+
+
+def _distogram_boundaries(config: SignalConfig) -> np.ndarray:
+    return np.linspace(
+        start=float(config.distogram_min_bin),
+        stop=float(config.distogram_max_bin),
+        num=int(config.distogram_no_bins) - 1,
+        dtype=np.float32,
+    )
+
+
+def _distogram_contact_query_radius(config: SignalConfig) -> float:
+    """Largest true distance that maps to a contact bin in Protenix distogram logic."""
+
+    contact_bin_count = int((_distogram_bin_centers(config) < float(config.contact_threshold)).sum())
+    if contact_bin_count <= 0:
+        return -1.0
+    if contact_bin_count >= int(config.distogram_no_bins):
+        return float("inf")
+    boundaries = _distogram_boundaries(config)
+    return float(boundaries[contact_bin_count - 1])
+
+
+def _distogram_contact_score(
+    distance: float,
+    boundaries: np.ndarray,
+    contact_bin_mask: np.ndarray,
+) -> float:
+    """Hard contact target matching compute_contact_prob() applied to true bins."""
+
+    true_bin = int(np.sum(float(distance) > boundaries))
+    return 1.0 if bool(contact_bin_mask[true_bin]) else 0.0
 
 
 def _distogram_rep_atom_mask(atom_array: Any, token_atoms: list[np.ndarray]) -> np.ndarray:
@@ -127,7 +163,7 @@ def _query_candidate_protein_tokens(
     protein_coords: np.ndarray,
     protein_atom_indices: np.ndarray,
     atom_to_token: np.ndarray,
-    contact_radius: float,
+    query_radius: float,
     protein_tree: Any,
     chunk_size: int,
 ) -> np.ndarray:
@@ -135,7 +171,7 @@ def _query_candidate_protein_tokens(
         return np.empty((0,), dtype=np.int64)
 
     if protein_tree is not None:
-        neighbors = protein_tree.query_ball_point(rna_coords, r=contact_radius)
+        neighbors = protein_tree.query_ball_point(rna_coords, r=query_radius)
         if len(neighbors) == 0:
             return np.empty((0,), dtype=np.int64)
         local_indices = sorted({idx for hit in neighbors for idx in hit})
@@ -148,7 +184,7 @@ def _query_candidate_protein_tokens(
     for start in range(0, protein_coords.shape[0], chunk_size):
         chunk = protein_coords[start : start + chunk_size]
         distances = np.linalg.norm(rna_coords[:, None, :] - chunk[None, :, :], axis=-1)
-        local = np.where(np.any(distances <= contact_radius, axis=0))[0]
+        local = np.where(np.any(distances <= query_radius, axis=0))[0]
         if local.size:
             candidate_local.append(local + start)
     if not candidate_local:
@@ -181,6 +217,9 @@ def compute_token_binding_signal(
     token_atoms = _token_atom_arrays(token_array)
     atom_to_token = _atom_to_token(token_atoms, n_atom)
     distogram_rep_atom_mask = _distogram_rep_atom_mask(atom_array, token_atoms)
+    distogram_boundaries = _distogram_boundaries(config)
+    contact_bin_mask = _distogram_bin_centers(config) < float(config.contact_threshold)
+    contact_query_radius = _distogram_contact_query_radius(config)
 
     protein_mask = is_protein & is_heavy & is_resolved & distogram_rep_atom_mask
     protein_atom_indices = np.nonzero(protein_mask)[0].astype(np.int64)
@@ -197,9 +236,11 @@ def compute_token_binding_signal(
         "n_positive_rna_token": 0,
         "signal_sum": 0.0,
         "signal_max": 0.0,
+        "distogram_contact_bin_count": int(contact_bin_mask.sum()),
+        "distogram_contact_query_radius": float(contact_query_radius),
     }
 
-    if protein_atom_indices.size == 0:
+    if protein_atom_indices.size == 0 or contact_query_radius < 0:
         return token_signal, token_signal_mask, token_resolved_mask, stats
 
     for token_idx, atom_indices in enumerate(token_atoms):
@@ -224,7 +265,7 @@ def compute_token_binding_signal(
             protein_coords=protein_coords,
             protein_atom_indices=protein_atom_indices,
             atom_to_token=atom_to_token,
-            contact_radius=float(config.contact_radius),
+            query_radius=float(contact_query_radius),
             protein_tree=protein_tree,
             chunk_size=int(config.protein_atom_chunk_size),
         )
@@ -245,14 +286,12 @@ def compute_token_binding_signal(
                 axis=-1,
             )
             distance = float(distances.min())
-            if distance > config.contact_radius:
-                continue
             score = max(
                 score,
-                _soft_contact(
+                _distogram_contact_score(
                     distance=distance,
-                    midpoint=config.contact_midpoint,
-                    temperature=config.contact_temperature,
+                    boundaries=distogram_boundaries,
+                    contact_bin_mask=contact_bin_mask,
                 ),
             )
         token_signal[token_idx] = np.float32(score)
@@ -278,13 +317,18 @@ def add_signal_annotations(
     token_array.set_annotation("rna_binding_resolved_mask", token_resolved_mask.astype(bool).tolist())
     bioassembly_dict["rna_binding_signal_meta"] = {
         "source": "structure_contact",
-        "version": 1,
+        "version": 2,
         "signal_level": "token",
         "signal_key": "token_array.rna_binding_signal",
         "signal_mask_key": "token_array.rna_binding_signal_mask",
         "resolved_mask_key": "token_array.rna_binding_resolved_mask",
         "distance_definition": "distogram_representative_atom_distance",
-        "scoring": "max_over_candidate_protein_tokens_soft_contact",
+        "scoring": "max_over_protein_tokens_binned_distogram_contact",
+        "contact_definition": (
+            "Assign true representative-atom distance to the same distogram bin used by "
+            "Protenix DistogramLoss, mark bins whose center is below contact_threshold as "
+            "contact, then max over protein tokens for each RNA token."
+        ),
         **asdict(config),
         "stats": stats,
     }
@@ -395,9 +439,32 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--bioassembly-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--contact-radius", type=float, default=8.0)
-    parser.add_argument("--contact-midpoint", type=float, default=6.0)
-    parser.add_argument("--contact-temperature", type=float, default=1.0)
+    parser.add_argument(
+        "--contact-threshold",
+        "--contact-radius",
+        dest="contact_threshold",
+        type=float,
+        default=8.0,
+        help=(
+            "Distogram contact threshold in Angstrom. Bins with center below this "
+            "threshold are contact bins. --contact-radius is kept as a deprecated alias."
+        ),
+    )
+    parser.add_argument("--distogram-min-bin", type=float, default=2.3125)
+    parser.add_argument("--distogram-max-bin", type=float, default=21.6875)
+    parser.add_argument("--distogram-no-bins", type=int, default=64)
+    parser.add_argument(
+        "--contact-midpoint",
+        type=float,
+        default=6.0,
+        help="Deprecated no-op. Signal now uses binned distogram hard contacts.",
+    )
+    parser.add_argument(
+        "--contact-temperature",
+        type=float,
+        default=1.0,
+        help="Deprecated no-op. Signal now uses binned distogram hard contacts.",
+    )
     parser.add_argument(
         "--base-weight",
         type=float,
@@ -439,9 +506,10 @@ def main() -> None:
         raise FileNotFoundError(f"bioassembly dir not found: {args.bioassembly_dir}")
 
     config = SignalConfig(
-        contact_radius=args.contact_radius,
-        contact_midpoint=args.contact_midpoint,
-        contact_temperature=args.contact_temperature,
+        contact_threshold=args.contact_threshold,
+        distogram_min_bin=args.distogram_min_bin,
+        distogram_max_bin=args.distogram_max_bin,
+        distogram_no_bins=args.distogram_no_bins,
         protein_atom_chunk_size=args.protein_atom_chunk_size,
     )
     files = list_input_files(args.bioassembly_dir, args.limit)
@@ -498,6 +566,10 @@ if __name__ == "__main__":
 python scripts/add_structure_rna_signal_to_protenix_pkl.py \
     --bioassembly-dir /inspire/ssd/project/sais-bio/public/xiangwenkai/GITHUB/Protenix_v1/data/train \
     --output-dir /inspire/ssd/project/sais-bio/public/xiangwenkai/GITHUB/Protenix_v1/data/train_signal \
+    --contact-threshold 8.0 \
+    --distogram-min-bin 2.3125 \
+    --distogram-max-bin 21.6875 \
+    --distogram-no-bins 64 \
     --num-workers 16 \
     --overwrite
 """

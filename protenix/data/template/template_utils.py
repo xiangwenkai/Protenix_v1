@@ -323,10 +323,12 @@ class TemplateHitFilter:
         release_dates: Mapping[str, datetime],
         obsolete_pdbs: Mapping[str, str],
         strict: bool = False,
+        allow_duplicate_query_templates: bool = False,
     ):
         self.release_dates = release_dates
         self.obsolete_pdbs = obsolete_pdbs
         self.strict = strict
+        self.allow_duplicate_query_templates = allow_duplicate_query_templates
 
     def _is_after_cutoff(self, pdb_id: str, cutoff: Optional[datetime]) -> bool:
         """Checks if a PDB entry was released after the cutoff date."""
@@ -353,7 +355,11 @@ class TemplateHitFilter:
             raise DateError(f"Release date for {pdb_code} is after cutoff.")
         if align_ratio <= min_align_ratio:
             raise AlignRatioError(f"Align ratio {align_ratio:.2f} <= {min_align_ratio}")
-        if t_seq in query_seq and len_ratio > max_subseq_ratio:
+        if (
+            not self.allow_duplicate_query_templates
+            and t_seq in query_seq
+            and len_ratio > max_subseq_ratio
+        ):
             raise DuplicateError("Hit is a large duplicate of the query.")
         if len(t_seq) < 10:
             raise LengthError("Template sequence too short.")
@@ -363,7 +369,7 @@ class TemplateHitFilter:
         self,
         query_seq: str,
         hit: TemplateHit,
-        max_date: datetime,
+        max_date: Optional[datetime],
     ) -> PrefilterResult:
         """Prefilters a hit and handles obsolete PDBs."""
         try:
@@ -717,7 +723,7 @@ class TemplateHitProcessor:
 
         date_str = res.mmcif_object.header.get("release_date", "9999-12-31")
         hit_date = datetime.strptime(date_str, "%Y-%m-%d")
-        if hit_date > max_date:
+        if max_date is not None and hit_date > max_date:
             err = f"Hit {pdb_id} date {hit_date} > {max_date}"
             return (
                 SingleHitResult(None, None, err if strict else None, None),
@@ -788,6 +794,8 @@ class TemplateHitFeaturizer:
         release_dates_path: Optional[str] = None,
         obsolete_pdbs_path: Optional[str] = None,
         strict_error_check: bool = False,
+        allow_duplicate_query_templates: bool = False,
+        prefer_similar_templates: bool = False,
         _shuffle_top_k_prefiltered: Optional[int] = None,
         _zero_center_positions: bool = True,
         _max_template_candidates_num: Optional[int] = None,
@@ -798,6 +806,8 @@ class TemplateHitFeaturizer:
         self._max_hits = max_hits
         self._kalign_binary_path = kalign_binary_path
         self._strict_error_check = strict_error_check
+        self._allow_duplicate_query_templates = allow_duplicate_query_templates
+        self._prefer_similar_templates = prefer_similar_templates
         self._shuffle_top_k_prefiltered = _shuffle_top_k_prefiltered
         self._zero_center_positions = _zero_center_positions
         self._max_template_candidates_num = _max_template_candidates_num
@@ -836,6 +846,7 @@ class TemplateHitFeaturizer:
             release_dates=self._release_dates,
             obsolete_pdbs=self._obsolete_pdbs,
             strict=self._strict_error_check,
+            allow_duplicate_query_templates=self._allow_duplicate_query_templates,
         )
 
         self._hit_processor = TemplateHitProcessor(
@@ -856,6 +867,45 @@ class TemplateHitFeaturizer:
             for pdb, v in data.items()
             if "release_date" in v
         }
+
+    @staticmethod
+    def _query_template_similarity(
+        query_sequence: str, template_sequence: str
+    ) -> Tuple[float, float, int]:
+        """Cheap sequence-similarity features for template ranking."""
+        query_len = max(1, len(query_sequence))
+        template_len = max(1, len(template_sequence))
+        overlap = min(query_len, template_len)
+        positional_same = 0
+        for idx in range(overlap):
+            if query_sequence[idx] == template_sequence[idx]:
+                positional_same += 1
+        positional_identity = positional_same / max(1, overlap)
+        length_similarity = 1.0 - (
+            abs(query_len - template_len) / max(query_len, template_len)
+        )
+        direct_subseq = int(
+            template_sequence in query_sequence or query_sequence in template_sequence
+        )
+        return positional_identity, length_similarity, direct_subseq
+
+    def _hit_sort_key(
+        self, hit: TemplateHit, query_sequence: str
+    ) -> Tuple[float, float, float, float, float, float]:
+        template_sequence = hit.hit_sequence.replace("-", "")
+        coverage = hit.aligned_cols / max(1, len(query_sequence))
+        positional_identity, length_similarity, direct_subseq = (
+            self._query_template_similarity(query_sequence, template_sequence)
+        )
+        sum_probs = hit.sum_probs if hit.sum_probs is not None else 0.0
+        return (
+            float(direct_subseq),
+            coverage,
+            positional_identity,
+            length_similarity,
+            sum_probs,
+            float(hit.aligned_cols),
+        )
 
     def get_templates(
         self,
@@ -899,10 +949,17 @@ class TemplateHitFeaturizer:
             if res.warning:
                 warnings.append(res.warning)
 
-        # Sort hits by sum_probs.
-        valid_hits.sort(
-            key=lambda x: x.sum_probs if x.sum_probs is not None else 0.0, reverse=True
-        )
+        if self._prefer_similar_templates:
+            valid_hits.sort(
+                key=lambda x: self._hit_sort_key(x, query_sequence),
+                reverse=True,
+            )
+        else:
+            # Original Protenix behavior: rank by sum_probs only.
+            valid_hits.sort(
+                key=lambda x: x.sum_probs if x.sum_probs is not None else 0.0,
+                reverse=True,
+            )
 
         # De-duplicate by hit sequence.
         deduped, seen_seq = [], set()

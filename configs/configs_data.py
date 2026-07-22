@@ -204,7 +204,8 @@ data_configs = {
                 RNA_DATA_ROOT_DIR, "train_signal"
             ),
             "indices_fpath": os.path.join(
-                RNA_DATA_ROOT_DIR, "protein_rna_train_signal.csv"
+                # RNA_DATA_ROOT_DIR, "protein_rna_train.csv"
+                RNA_DATA_ROOT_DIR, "protein_rna_train_filter.csv"
             ),
             "pdb_list": "",
             "random_sample_if_failed": True,
@@ -224,11 +225,12 @@ data_configs = {
                 RNA_DATA_ROOT_DIR, "train_signal"
             ),
             "indices_fpath": os.path.join(
-                RNA_DATA_ROOT_DIR, "protein_rna_test_signal.csv"
+                # RNA_DATA_ROOT_DIR, "protein_rna_test.csv"
+                RNA_DATA_ROOT_DIR, "protein_rna_test_filter.csv"
             ),
             "pdb_list": "",
             # "max_n_token": GlobalConfigValue("test_max_n_token"),  # filter data
-            "max_n_token": 2000,  # filter data
+            "max_n_token": 1600,  # filter data
             "sort_by_n_token": False,
             "group_by_pdb_id": True,
             "find_eval_chain_interface": True,

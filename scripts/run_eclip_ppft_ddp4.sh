@@ -3,6 +3,180 @@ set -euo pipefail
 
 cd /inspire/ssd/project/sais-bio/public/xiangwenkai/Protenix_v1
 
+if [[ -n "${RUN_RECOMMENDED_MIXED_SFT_STAGE:-}" ]]; then
+  export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+  export PROTENIX_ROOT_DIR="${PROTENIX_ROOT_DIR:-/inspire/ssd/project/sais-bio/public/xiangwenkai/Protenix_v1}"
+  export PYTHONPATH="${PROTENIX_ROOT_DIR}:${PYTHONPATH:-}"
+  export LAYERNORM_TYPE="${LAYERNORM_TYPE:-torch}"
+
+  MIXED_SFT_LOAD_CKPT="${MIXED_SFT_LOAD_CKPT:-${PROTENIX_ROOT_DIR}/checkpoint/protenix_base_20250630_v1.0.0.pt}"
+  MIXED_SFT_BASE_DIR="${MIXED_SFT_BASE_DIR:-./output}"
+  MIXED_SFT_ECLIP_DATA_DIR="${MIXED_SFT_ECLIP_DATA_DIR:-/inspire/ssd/project/sais-bio/public/xiangwenkai/GITHUB/parnet/data_process/high_quality_positive}"
+  MIXED_SFT_PDB_TRAIN_DIR="${MIXED_SFT_PDB_TRAIN_DIR:-/inspire/ssd/project/sais-bio/public/xiangwenkai/GITHUB/Protenix_v1/data/train_signal}"
+  MIXED_SFT_PDB_TEST_DIR="${MIXED_SFT_PDB_TEST_DIR:-/inspire/ssd/project/sais-bio/public/xiangwenkai/GITHUB/Protenix_v1/data/train_signal}"
+  MIXED_SFT_NPROC_PER_NODE="${MIXED_SFT_NPROC_PER_NODE:-4}"
+
+  common_mixed_sft_args=(
+    --model_name protenix_base_20250630_v1.0.0
+    --eval_first True
+    --iters_to_accumulate "${MIXED_SFT_ITERS_TO_ACCUMULATE:-1}"
+    --seed "${MIXED_SFT_SEED:-42}"
+    --base_dir "${MIXED_SFT_BASE_DIR}"
+    --dtype bf16
+    --project "${MIXED_SFT_PROJECT:-protenix_sft}"
+    --load_strict False
+    --load_params_only True
+    --use_wandb "${MIXED_SFT_USE_WANDB:-True}"
+    --data.num_dl_workers "${MIXED_SFT_NUM_DL_WORKERS:-2}"
+    --log_interval "${MIXED_SFT_LOG_INTERVAL:-50}"
+    --grad_clip_norm 1
+    --sample_diffusion.N_step 20
+    --triangle_attention cuequivariance
+    --triangle_multiplicative cuequivariance
+    --load_checkpoint_path "${MIXED_SFT_LOAD_CKPT}"
+    --data.train_sets train_rna_before202606
+    --data.test_sets test_rna_before202606
+    --data.train_rna_before202606.base_info.bioassembly_dict_dir "${MIXED_SFT_PDB_TRAIN_DIR}"
+    --data.test_rna_before202606.base_info.bioassembly_dict_dir "${MIXED_SFT_PDB_TEST_DIR}"
+    --eclip_ppft.data_dir "${MIXED_SFT_ECLIP_DATA_DIR}"
+    --eclip_ppft.num_workers "${MIXED_SFT_ECLIP_NUM_WORKERS:-16}"
+    --eclip_ppft.max_protein_length 600
+    --eclip_ppft.distogram_contact_threshold 8.0
+    --eclip_ppft.signal_profile_weight 1.0
+    --eclip_ppft.signal_multinomial_min_height 3.0
+    --eclip_ppft.signal_binary_threshold 2.0
+    --eclip_ppft.signal_clip_value 100.0
+    --eclip_ppft.signal_multinomial_max_total 100.0
+    --eclip_ppft.confidence_quality_target 0.8
+    --eclip_ppft.confidence_rollout_steps 20
+    --eclip_ppft.use_cell_condition True
+    --mixed_sft.rollout_metric_contact_cutoff 8.0
+    --foldbench_eval.enable "${MIXED_SFT_FOLDBENCH_ENABLE:-False}"
+  )
+
+  case "${RUN_RECOMMENDED_MIXED_SFT_STAGE}" in
+    smoke)
+      stage_mixed_sft_args=(
+        --run_name mixed_pdb_eclip_smoke
+        --diffusion_batch_size 16
+        --eval_interval 100
+        --checkpoint_interval 500
+        --train_crop_size 384
+        --max_steps "${MIXED_SFT_MAX_STEPS:-1000}"
+        --warmup_steps 100
+        --lr 0.0
+        --finetune.lr 0.00001
+        --finetune.lr_scheduler cosine_annealing
+        --finetune_params_with_substring distogram_head,diffusion_module.cell_adapter.,pairformer_stack.blocks.47.
+        --loss.weight.alpha_pae 0.0
+        --loss.weight.alpha_diffusion 4.0
+        --loss.weight.alpha_distogram 0.03
+        --loss.weight.alpha_bond 1.0
+        --loss.weight.smooth_lddt 0.0
+        --eclip_ppft.eval_max_steps 8
+        --mixed_sft.pdb_eval_max_steps 2
+        --eclip_ppft.signal_loss_weight 0.02
+        --eclip_ppft.confidence_quality_weight 0.05
+        --rna_signal_sft.signal_loss_weight 0.005
+        --mixed_sft.pdb_sample_prob 0.5
+        --mixed_sft.freeze_confidence_head True
+      )
+      ;;
+    stage1)
+      stage_mixed_sft_args=(
+        --run_name mixed_pdb_eclip_stage1_selective
+        --diffusion_batch_size 32
+        --eval_interval 1000
+        --checkpoint_interval 1000
+        --train_crop_size 640
+        --max_steps "${MIXED_SFT_MAX_STEPS:-40000}"
+        --warmup_steps 1000
+        --lr 0.0
+        --finetune.lr 0.00002
+        --finetune.lr_scheduler cosine_annealing
+        --finetune_params_with_substring distogram_head,diffusion_module.cell_adapter.,pairformer_stack.blocks.46.,pairformer_stack.blocks.47.
+        --loss.weight.alpha_pae 0.0
+        --loss.weight.alpha_diffusion 4.0
+        --loss.weight.alpha_distogram 0.03
+        --loss.weight.alpha_bond 1.0
+        --loss.weight.smooth_lddt 0.0
+        --eclip_ppft.eval_max_steps 15
+        --mixed_sft.pdb_eval_max_steps 5
+        --eclip_ppft.signal_loss_weight 0.02
+        --eclip_ppft.confidence_quality_weight 0.05
+        --rna_signal_sft.signal_loss_weight 0.005
+        --mixed_sft.pdb_sample_prob 0.5
+        --mixed_sft.freeze_confidence_head True
+      )
+      ;;
+    stage2)
+      stage_mixed_sft_args=(
+        --run_name mixed_pdb_eclip_stage2_signal_adapt
+        --diffusion_batch_size 32
+        --eval_interval 1000
+        --checkpoint_interval 1000
+        --train_crop_size "${MIXED_SFT_TRAIN_CROP_SIZE:-640}"
+        --max_steps "${MIXED_SFT_MAX_STEPS:-60000}"
+        --warmup_steps 1000
+        --lr 0.0
+        --finetune.lr 0.00001
+        --finetune.lr_scheduler cosine_annealing
+        --finetune_params_with_substring distogram_head,diffusion_module.cell_adapter.,pairformer_stack.blocks.44.,pairformer_stack.blocks.45.,pairformer_stack.blocks.46.,pairformer_stack.blocks.47.
+        --loss.weight.alpha_pae 0.0
+        --loss.weight.alpha_diffusion 4.0
+        --loss.weight.alpha_distogram 0.03
+        --loss.weight.alpha_bond 1.0
+        --loss.weight.smooth_lddt 0.0
+        --eclip_ppft.eval_max_steps 20
+        --mixed_sft.pdb_eval_max_steps 5
+        --eclip_ppft.signal_loss_weight 0.05
+        --eclip_ppft.confidence_quality_weight 0.10
+        --rna_signal_sft.signal_loss_weight 0.01
+        --mixed_sft.pdb_sample_prob 0.35
+        --mixed_sft.freeze_confidence_head True
+      )
+      ;;
+    stage3)
+      stage_mixed_sft_args=(
+        --run_name mixed_pdb_eclip_stage3_head_calibration
+        --diffusion_batch_size 32
+        --eval_interval 1000
+        --checkpoint_interval 1000
+        --train_crop_size "${MIXED_SFT_TRAIN_CROP_SIZE:-640}"
+        --max_steps "${MIXED_SFT_MAX_STEPS:-20000}"
+        --warmup_steps 500
+        --lr 0.0
+        --finetune.lr 0.00001
+        --finetune.lr_scheduler cosine_annealing
+        --finetune_params_with_substring confidence_head,distogram_head,diffusion_module.cell_adapter.,pairformer_stack.blocks.46.,pairformer_stack.blocks.47.
+        --loss.weight.alpha_pae 1.0
+        --loss.weight.alpha_diffusion 0.0
+        --loss.weight.alpha_distogram 0.03
+        --loss.weight.alpha_bond 0.0
+        --loss.weight.smooth_lddt 0.0
+        --eclip_ppft.eval_max_steps 20
+        --mixed_sft.pdb_eval_max_steps 5
+        --eclip_ppft.signal_loss_weight 0.02
+        --eclip_ppft.confidence_quality_weight 0.20
+        --rna_signal_sft.signal_loss_weight 0.005
+        --mixed_sft.pdb_sample_prob 0.5
+        --mixed_sft.freeze_confidence_head False
+      )
+      ;;
+    *)
+      echo "Unknown RUN_RECOMMENDED_MIXED_SFT_STAGE=${RUN_RECOMMENDED_MIXED_SFT_STAGE}" >&2
+      echo "Supported stages: smoke, stage1, stage2, stage3" >&2
+      exit 2
+      ;;
+  esac
+
+  torchrun --standalone --nproc_per_node="${MIXED_SFT_NPROC_PER_NODE}" \
+    runner/train_rna_eclip_mixed_sft.py \
+    "${common_mixed_sft_args[@]}" \
+    "${stage_mixed_sft_args[@]}"
+  exit 0
+fi
+
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}" \
 PROTENIX_ROOT_DIR=/inspire/ssd/project/sais-bio/public/xiangwenkai/Protenix_v1 \
 PYTHONPATH=/inspire/ssd/project/sais-bio/public/xiangwenkai/Protenix_v1 \
@@ -122,9 +296,9 @@ PROTENIX_ROOT_DIR=/inspire/ssd/project/sais-bio/public/xiangwenkai/Protenix_v1 \
 PYTHONPATH=/inspire/ssd/project/sais-bio/public/xiangwenkai/Protenix_v1 \
 LAYERNORM_TYPE=torch \
 torchrun --standalone --nproc_per_node=4 runner/train_rna_eclip_mixed_sft.py \
-  --model_name protenix_base_default_v1.0.0 \
+  --model_name protenix_base_20250630_v1.0.0 \
   --run_name pdb_eclip_mixed_rna_signal_sft \
-  --eval_first False \
+  --eval_first True \
   --iters_to_accumulate 1 \
   --seed 42 \
   --base_dir ./output \
@@ -141,7 +315,10 @@ torchrun --standalone --nproc_per_node=4 runner/train_rna_eclip_mixed_sft.py \
   --train_crop_size 640 \
   --max_steps 100000 \
   --warmup_steps 1000 \
-  --lr 0.0001 \
+  --lr 0.0 \
+  --finetune.lr 0.00002 \
+  --finetune_params_with_substring distogram_head,diffusion_module.cell_adapter.,pairformer_stack.blocks.46.,pairformer_stack.blocks.47. \
+  --grad_clip_norm 1 \
   --sample_diffusion.N_step 20 \
   --loss.weight.alpha_pae 1.0 \
   --loss.weight.alpha_diffusion 4.0 \
@@ -150,26 +327,26 @@ torchrun --standalone --nproc_per_node=4 runner/train_rna_eclip_mixed_sft.py \
   --loss.weight.smooth_lddt 1.0 \
   --triangle_attention cuequivariance \
   --triangle_multiplicative cuequivariance \
-  --load_checkpoint_path /inspire/ssd/project/sais-bio/public/xiangwenkai/Protenix_v1/checkpoint/protenix_base_default_v1.0.0.pt \
+  --load_checkpoint_path /inspire/ssd/project/sais-bio/public/xiangwenkai/Protenix_v1/checkpoint/protenix_base_20250630_v1.0.0.pt \
   --data.train_sets train_rna_before202606 \
   --data.test_sets test_rna_before202606 \
   --data.train_rna_before202606.base_info.bioassembly_dict_dir /inspire/ssd/project/sais-bio/public/xiangwenkai/GITHUB/Protenix_v1/data/train_signal \
   --data.test_rna_before202606.base_info.bioassembly_dict_dir /inspire/ssd/project/sais-bio/public/xiangwenkai/GITHUB/Protenix_v1/data/train_signal \
   --eclip_ppft.data_dir /inspire/ssd/project/sais-bio/public/xiangwenkai/GITHUB/parnet/data_process/high_quality_positive \
-  --eclip_ppft.num_workers 0 \
+  --eclip_ppft.num_workers 16 \
   --eclip_ppft.max_protein_length 600 \
-  --eclip_ppft.eval_max_steps 32 \
+  --eclip_ppft.eval_max_steps 15 \
+  --mixed_sft.pdb_eval_max_steps 5 \
   --eclip_ppft.signal_profile_weight 1.0 \
   --eclip_ppft.signal_multinomial_min_height 3.0 \
   --eclip_ppft.signal_binary_threshold 2.0 \
   --eclip_ppft.signal_clip_value 100.0 \
   --eclip_ppft.signal_multinomial_max_total 100.0 \
-  --eclip_ppft.confidence_quality_weight 0.2 \
+  --eclip_ppft.confidence_quality_weight 0.1 \
   --eclip_ppft.confidence_quality_target 0.8 \
   --eclip_ppft.confidence_rollout_steps 20 \
-  --rna_signal_sft.signal_target_threshold 0.0 \
-  --rna_signal_sft.signal_min_peak 0.5 \
-  --rna_signal_sft.signal_binary_threshold 0.5 \
-  --rna_signal_sft.signal_loss_weight 0.05 \
+  --eclip_ppft.use_cell_condition True \
+  --rna_signal_sft.signal_loss_weight 0.01 \
   --mixed_sft.pdb_sample_prob 0.2 \
-  --mixed_sft.rollout_metric_contact_cutoff 5.0
+  --foldbench_eval.enable True
+

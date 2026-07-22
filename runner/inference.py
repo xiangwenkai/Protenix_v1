@@ -493,6 +493,7 @@ def infer_predict(runner: InferenceRunner, configs: Any) -> None:
                         for k, v in data["entity_poly_type"].items()
                         if v != "non-polymer"
                     },
+                    input_feature_dict=data["input_feature_dict"],
                 )
                 t2_end = time.time()
                 logger.info(
