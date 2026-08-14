@@ -21,7 +21,18 @@ from protenix.config.extend_types import GlobalConfigValue, ListValue
 
 # PROTENIX_ROOT_DIR = os.environ.get("PROTENIX_ROOT_DIR", str(Path.home()))
 PROTENIX_ROOT_DIR = os.environ.get("PROTENIX_ROOT_DIR", "/inspire/ssd/project/sais-bio/public/Protein/data/AI_Models/protenix_v1_dataset/")
-rna_msa_dir = os.environ.get("PROTENIX_RNA_DATA_ROOT_DIR", PROTENIX_ROOT_DIR)
+REBUILT_MODIFIED_RNA_DIR = os.environ.get(
+    "PROTENIX_REBUILT_MODIFIED_RNA_DIR",
+    "/inspire/ssd/project/sais-bio/public/ash_proj/data/stanford-rna-3d-folding/part2/rebuilt_RNA/rebuilt_modified",
+)
+# REBUILT_MODIFIED_RNA_DIR = os.environ.get(
+#     "PROTENIX_REBUILT_MODIFIED_RNA_DIR",
+#     "/inspire/ssd/tenant_predefaa-9a1b-4522-bb10-8850f313be13/global_public/ash_proj/data/stanford-rna-3d-folding/part2/rebuilt_RNA/rebuilt_modified",
+# )
+REBUILT_MODIFIED_PREPARED_DIR = os.path.join(
+    REBUILT_MODIFIED_RNA_DIR, "protenix_prepared"
+)
+custom_rna_msa_dir = REBUILT_MODIFIED_PREPARED_DIR
 # custom_rna_dir = "/inspire/ssd/project/sais-bio/public/xiangwenkai/GITHUB/Protenix_v1/data/"
 RNA_DATA_ROOT_DIR = os.environ.get("PROTENIX_DATA_ROOT_DIR", "/inspire/ssd/project/sais-bio/public/xiangwenkai/GITHUB/Protenix_v1/data")
 # mmcif_dir1 = "/root/ossfs2-bucket/xiangwenkai"
@@ -137,12 +148,12 @@ data_configs = {
     "epoch_size": 10000,
     "train_ref_pos_augment": True,
     "test_ref_pos_augment": True,
-    "train_sets": ListValue(["weightedPDB_before2109_wopb_nometalc_0925"]),
+    "train_sets": ListValue(["rebuilt_modified_rna_train"]),
     "train_sampler": {
         "train_sample_weights": ListValue([1.0]),
         "sampler_type": "weighted",
     },
-    "test_sets": ListValue(["recentPDB_1536_sample384_0925"]),
+    "test_sets": ListValue(["rebuilt_modified_rna_test"]),
     # NOTE:
     # `weightedPDB_before2109_wopb_nometalc_0925` is compatible with the `2024.05.22` data version
     # downloaded via `scripts/database/download_protenix_data.sh`.
@@ -247,6 +258,83 @@ data_configs = {
     #     },
     #     **deepcopy(default_test_configs),
     # },
+    "rebuilt_modified_rna_train": {
+        "base_info": {
+            "mmcif_dir": os.path.join(REBUILT_MODIFIED_RNA_DIR, "mmcif"),
+            "bioassembly_dict_dir": os.path.join(
+                REBUILT_MODIFIED_PREPARED_DIR, "rna_bioassembly"
+            ),
+            "indices_fpath": os.path.join(
+                REBUILT_MODIFIED_PREPARED_DIR,
+                "indices/rna_bioassembly_indices.csv",
+            ),
+            "pdb_list": os.path.join(
+                REBUILT_MODIFIED_PREPARED_DIR,
+                "rna_train_pdb_list_filtered.txt",
+            ),
+            "random_sample_if_failed": True,
+            "max_n_token": -1,
+            "use_reference_chains_only": False,
+            "exclusion": {
+                "mol_1_type": ListValue(["ions"]),
+                "mol_2_type": ListValue(["ions"]),
+            },
+        },
+        "msa": {
+            "enable_rna_msa": True,
+            "rna_seq_or_filename_to_msadir_jsons": ListValue(
+                [
+                    os.path.join(
+                        REBUILT_MODIFIED_PREPARED_DIR,
+                        "rna_msa/rna_sequence_to_pdb_chains.json",
+                    )
+                ]
+            ),
+            "rna_msadir_raw_paths": ListValue(
+                [os.path.join(REBUILT_MODIFIED_PREPARED_DIR, "rna_msa/msas")]
+            ),
+            "rna_indexing_methods": ListValue(["sequence"]),
+        },
+        **deepcopy(default_weighted_pdb_configs),
+    },
+    "rebuilt_modified_rna_test": {
+        "base_info": {
+            "mmcif_dir": os.path.join(REBUILT_MODIFIED_RNA_DIR, "mmcif"),
+            "bioassembly_dict_dir": os.path.join(
+                REBUILT_MODIFIED_PREPARED_DIR, "rna_bioassembly"
+            ),
+            "indices_fpath": os.path.join(
+                REBUILT_MODIFIED_PREPARED_DIR,
+                "indices/rna_bioassembly_indices.csv",
+            ),
+            "pdb_list": os.path.join(
+                REBUILT_MODIFIED_PREPARED_DIR,
+                "rna_val_pdb_list_filtered.txt",
+            ),
+            "max_n_token": 1500,
+            "sort_by_n_token": False,
+            "group_by_pdb_id": True,
+            "find_eval_chain_interface": False,
+            "skip_sample_if_failed": True,
+            "sample_timeout_seconds": 60,
+        },
+        "msa": {
+            "enable_rna_msa": True,
+            "rna_seq_or_filename_to_msadir_jsons": ListValue(
+                [
+                    os.path.join(
+                        REBUILT_MODIFIED_PREPARED_DIR,
+                        "rna_msa/rna_sequence_to_pdb_chains.json",
+                    )
+                ]
+            ),
+            "rna_msadir_raw_paths": ListValue(
+                [os.path.join(REBUILT_MODIFIED_PREPARED_DIR, "rna_msa/msas")]
+            ),
+            "rna_indexing_methods": ListValue(["sequence"]),
+        },
+        **deepcopy(default_test_configs),
+    },
     "train_rna_before202606": {
         "base_info": {
             "mmcif_dir": os.path.join(RNA_DATA_ROOT_DIR, "protein_rna"),
@@ -573,10 +661,10 @@ data_configs = {
         "prot_indexing_methods": ListValue(["sequence"]),
         "enable_rna_msa": True,  # enable rna msa
         "rna_seq_or_filename_to_msadir_jsons": ListValue(
-            [os.path.join(PROTENIX_ROOT_DIR, "rna_msa/rna_sequence_to_pdb_chains.json")]
+            [os.path.join(custom_rna_msa_dir, "rna_msa/rna_sequence_to_pdb_chains.json")]
         ),
         "rna_msadir_raw_paths": ListValue(
-            [os.path.join(PROTENIX_ROOT_DIR, "rna_msa/msas")]
+            [os.path.join(custom_rna_msa_dir, "rna_msa/msas")]
         ),
         "rna_indexing_methods": ListValue(["sequence"]),
         "min_size": {
