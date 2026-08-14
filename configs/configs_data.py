@@ -20,12 +20,12 @@ from pathlib import Path
 from protenix.config.extend_types import GlobalConfigValue, ListValue
 
 sys_dir = "/inspire/ssd/project/sais-bio/public"
-# sys_dir = ""
+# sys_dir = "/root/ossfs2-bucket"
 # PROTENIX_ROOT_DIR = os.environ.get("PROTENIX_ROOT_DIR", str(Path.home()))
 PROTENIX_ROOT_DIR = os.environ.get("PROTENIX_ROOT_DIR", f"{sys_dir}/Protein/data/AI_Models/protenix_v1_dataset/")
 REBUILT_MODIFIED_RNA_DIR = os.environ.get(
     "PROTENIX_REBUILT_MODIFIED_RNA_DIR",
-    f"{sys_dir}/ash_proj/data/stanford-rna-3d-folding/part2/rebuilt_RNA/rebuilt_modified",
+    f"{sys_dir}/xiangwenkai/data/rebuilt_modified",
 )
 # REBUILT_MODIFIED_RNA_DIR = os.environ.get(
 #     "PROTENIX_REBUILT_MODIFIED_RNA_DIR",
@@ -37,7 +37,6 @@ REBUILT_MODIFIED_PREPARED_DIR = os.path.join(
 custom_rna_msa_dir = REBUILT_MODIFIED_PREPARED_DIR
 # custom_rna_dir = f"{sys_dir}/xiangwenkai/GITHUB/Protenix_v1/data/"
 RNA_DATA_ROOT_DIR = os.environ.get("PROTENIX_DATA_ROOT_DIR", f"{sys_dir}/xiangwenkai/GITHUB/Protenix_v1/data")
-# mmcif_dir1 = "/root/ossfs2-bucket/xiangwenkai"
 mmcif_dir1 = f"{sys_dir}/xiangwenkai"
 
 
