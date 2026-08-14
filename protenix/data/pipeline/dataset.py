@@ -93,6 +93,12 @@ class BaseSingleDataset(Dataset):
         self.random_sample_if_failed = kwargs.get("random_sample_if_failed", False)
         self.use_reference_chains_only = kwargs.get("use_reference_chains_only", False)
         self.is_distillation = kwargs.get("is_distillation", False)
+        self.is_eclip_distillation = kwargs.get(
+            "is_eclip_distillation",
+            bool(self.is_distillation)
+            and self.name is not None
+            and "eclip" in self.name,
+        )
 
         # Configs for data filters
         self.max_n_token = kwargs.get("max_n_token", -1)
@@ -741,6 +747,42 @@ class BaseSingleDataset(Dataset):
         features_dict["constraint_log_info"] = log_dict
         return token_array, atom_array, features_dict, msa_features, full_atom_array
 
+    @staticmethod
+    def _get_optional_token_annotation(
+        token_array: TokenArray, annotation_name: str
+    ) -> Optional[np.ndarray]:
+        if len(token_array) == 0:
+            return None
+        if annotation_name not in token_array[0]._annot:
+            return None
+        return np.asarray(token_array.get_annotation(annotation_name))
+
+    @classmethod
+    def _get_precomputed_eclip_binding_token_mask(
+        cls, token_array: TokenArray
+    ) -> torch.Tensor:
+        """Read optional token-level eCLIP binding annotations from prepared pkl files."""
+
+        signal = cls._get_optional_token_annotation(token_array, "rna_binding_signal")
+        signal_mask = cls._get_optional_token_annotation(
+            token_array, "rna_binding_signal_mask"
+        )
+        if signal is not None:
+            binding_mask = signal.astype(np.float32) > 0.0
+            if signal_mask is not None:
+                binding_mask &= signal_mask.astype(bool)
+            return torch.from_numpy(binding_mask.astype(np.float32))
+
+        interface = cls._get_optional_token_annotation(
+            token_array, "distillation_protein_rna_interface"
+        )
+        if interface is not None:
+            return torch.from_numpy(
+                (interface.astype(np.float32) > 0.0).astype(np.float32)
+            )
+
+        return torch.zeros(len(token_array), dtype=torch.float32)
+
     def get_feature_and_label(
         self,
         idx: int,
@@ -882,6 +924,12 @@ class BaseSingleDataset(Dataset):
 
         features_dict = make_dummy_feature(
             features_dict=features_dict, dummy_feats=dummy_feats
+        )
+        features_dict["eclip_binding_token_mask"] = (
+            self._get_precomputed_eclip_binding_token_mask(token_array)
+        )
+        features_dict["is_eclip_distillation"] = torch.tensor(
+            [self.is_eclip_distillation]
         )
         # Transform to right data type
         features_dict = data_type_transform(feat_or_label_dict=features_dict)

@@ -449,6 +449,22 @@ loss_configs = {
             "no_bins": 64,
             "eps": 1e-6,
         },
+        "eclip_binding_only": {
+            "enable": False,
+            "only_eclip_distillation": True,
+            "use_precomputed_token_mask": True,
+            "contact_threshold": 8.0,
+            "non_binding_token_weight": 1e-2,
+            "binding_window_radius": 2,
+            "binding_window_min_weight": 0.25,
+            "binding_window_decay": "gaussian",
+            "binding_window_same_asym_only": True,
+            "other_loss_weight_scale": 1e-2,
+            "distogram_loss_weight_scale": 1.0,
+            # any: one endpoint binding; outer: product of endpoint weights
+            "pair_weight_mode": "any",
+            "skip_distogram_if_no_binding_site": True,
+        },
     },
     "metrics": {
         "lddt": {

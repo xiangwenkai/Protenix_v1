@@ -1044,6 +1044,8 @@ def get_data_shape_dict(
         "atom_to_tokatom_idx": (num_atom,),  # after crop
         "pae_rep_atom_mask": (num_atom,),  # same as "pae_rep_atom_mask" in label_dict
         "is_distillation": (1,),
+        "is_eclip_distillation": (1,),
+        "eclip_binding_token_mask": (num_token,),
     }
 
     # Label

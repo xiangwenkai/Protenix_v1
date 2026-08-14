@@ -596,6 +596,7 @@ class DistogramLoss(nn.Module):
         true_coordinate: torch.Tensor,
         coordinate_mask: torch.Tensor,
         rep_atom_mask: torch.Tensor,
+        token_pair_weight: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Distogram loss
 
@@ -608,6 +609,8 @@ class DistogramLoss(nn.Module):
                 [N_atom] or [..., N_atom]
             rep_atom_mask (torch.Tensor): representative atom mask.
                 [N_atom]
+            token_pair_weight (Optional[torch.Tensor]): Optional token-token loss weight.
+                [N_token, N_token] or [..., N_token, N_token]
 
         Returns:
             torch.Tensor: the return loss.
@@ -625,6 +628,11 @@ class DistogramLoss(nn.Module):
             logits=logits,
             labels=true_bins,
         )  # [..., N_token, N_token]
+
+        if token_pair_weight is not None:
+            pair_mask = pair_mask * token_pair_weight.to(
+                device=pair_mask.device, dtype=pair_mask.dtype
+            )
 
         denom = self.eps + torch.sum(pair_mask, dim=(-1, -2))
         loss = torch.sum(errors * pair_mask, dim=(-1, -2))
@@ -1484,6 +1492,224 @@ class ProtenixLoss(nn.Module):
         self.smooth_lddt_loss = SmoothLDDTLoss(**configs.loss.diffusion.smooth_lddt)
         self.distogram_loss = DistogramLoss(**configs.loss.distogram)
 
+    def _is_eclip_binding_only_sample(self, feat_dict: dict[str, Any]) -> bool:
+        cfg = self.configs.loss.eclip_binding_only
+        if not cfg.enable:
+            return False
+        if not cfg.only_eclip_distillation:
+            return True
+
+        is_eclip = feat_dict.get("is_eclip_distillation")
+        if is_eclip is None:
+            is_eclip = feat_dict.get("is_distillation")
+        if is_eclip is None:
+            return False
+        return bool(is_eclip.detach().bool().any().item())
+
+    def _eclip_binding_contact_radius(self) -> float:
+        cfg = self.configs.loss.eclip_binding_only
+        distogram_cfg = self.configs.loss.distogram
+        no_bins = int(distogram_cfg.no_bins)
+        bin_width = (
+            float(distogram_cfg.max_bin) - float(distogram_cfg.min_bin)
+        ) / no_bins
+        centers = torch.linspace(
+            start=float(distogram_cfg.min_bin),
+            end=float(distogram_cfg.max_bin) - bin_width,
+            steps=no_bins,
+        ) + 0.5 * bin_width
+        contact_bin_count = int((centers < float(cfg.contact_threshold)).sum().item())
+        if contact_bin_count <= 0:
+            return -1.0
+        if contact_bin_count >= no_bins:
+            return float("inf")
+        boundaries = torch.linspace(
+            start=float(distogram_cfg.min_bin),
+            end=float(distogram_cfg.max_bin),
+            steps=no_bins - 1,
+        )
+        return float(boundaries[contact_bin_count - 1].item())
+
+    def _derive_binding_token_mask_from_structure(
+        self,
+        feat_dict: dict[str, Any],
+        label_dict: dict[str, Any],
+    ) -> torch.Tensor:
+        rep_atom_mask = feat_dict["distogram_rep_atom_mask"].bool()
+        token_coordinate_mask = label_dict["coordinate_mask"][rep_atom_mask].bool()
+        device = label_dict["coordinate"].device
+        n_token = int(rep_atom_mask.sum().item())
+        binding_token_mask = torch.zeros(n_token, device=device, dtype=torch.bool)
+
+        contact_radius = self._eclip_binding_contact_radius()
+        if contact_radius < 0:
+            return binding_token_mask
+
+        is_protein = feat_dict["is_protein"][rep_atom_mask].bool()
+        is_rna = feat_dict["is_rna"][rep_atom_mask].bool()
+        if not bool(is_protein.any().item()) or not bool(is_rna.any().item()):
+            return binding_token_mask
+
+        token_coord = label_dict["coordinate"][rep_atom_mask]
+        token_distance = cdist(token_coord, token_coord)
+        valid_pair_mask = token_coordinate_mask[:, None] & token_coordinate_mask[None, :]
+        protein_rna_pair_mask = (
+            (is_protein[:, None] & is_rna[None, :])
+            | (is_rna[:, None] & is_protein[None, :])
+        )
+        contact_pair_mask = (
+            (token_distance <= contact_radius) & valid_pair_mask & protein_rna_pair_mask
+        )
+        binding_token_mask = contact_pair_mask.any(dim=-1) | contact_pair_mask.any(
+            dim=-2
+        )
+        return binding_token_mask
+
+    def _get_eclip_binding_token_mask(
+        self,
+        feat_dict: dict[str, Any],
+        label_dict: dict[str, Any],
+    ) -> torch.Tensor:
+        cfg = self.configs.loss.eclip_binding_only
+        rep_atom_mask = feat_dict["distogram_rep_atom_mask"].bool()
+        n_token = int(rep_atom_mask.sum().item())
+        if cfg.use_precomputed_token_mask and "eclip_binding_token_mask" in feat_dict:
+            precomputed_mask = feat_dict["eclip_binding_token_mask"].to(
+                device=label_dict["coordinate"].device
+            )
+            if (
+                precomputed_mask.shape[-1] == n_token
+                and bool((precomputed_mask > 0).any().item())
+            ):
+                return precomputed_mask.bool()
+        return self._derive_binding_token_mask_from_structure(feat_dict, label_dict)
+
+    def _get_eclip_distogram_pair_weight(
+        self,
+        feat_dict: dict[str, Any],
+        label_dict: dict[str, Any],
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        cfg = self.configs.loss.eclip_binding_only
+        binding_token_mask = self._get_eclip_binding_token_mask(feat_dict, label_dict)
+        n_binding_token = binding_token_mask.sum()
+        if cfg.skip_distogram_if_no_binding_site and int(n_binding_token.item()) == 0:
+            pair_weight = torch.zeros(
+                binding_token_mask.shape[0],
+                binding_token_mask.shape[0],
+                device=binding_token_mask.device,
+                dtype=label_dict["coordinate"].dtype,
+            )
+            token_weight = torch.zeros_like(
+                binding_token_mask, dtype=label_dict["coordinate"].dtype
+            )
+        else:
+            token_weight = self._get_eclip_binding_token_weight(
+                feat_dict=feat_dict,
+                label_dict=label_dict,
+                binding_token_mask=binding_token_mask,
+            )
+            if cfg.pair_weight_mode == "any":
+                pair_weight = torch.maximum(token_weight[:, None], token_weight[None, :])
+            elif cfg.pair_weight_mode in ["outer", "product"]:
+                pair_weight = token_weight[:, None] * token_weight[None, :]
+            else:
+                raise ValueError(
+                    f"Unknown eclip pair_weight_mode: {cfg.pair_weight_mode}"
+                )
+
+        metrics = {
+            "eclip_binding_token_count": n_binding_token.detach().to(
+                dtype=label_dict["coordinate"].dtype
+            ),
+            "eclip_binding_window_token_count": (
+                token_weight > float(cfg.non_binding_token_weight)
+            )
+            .sum()
+            .detach()
+            .to(dtype=label_dict["coordinate"].dtype),
+            "eclip_binding_pair_weight_sum": pair_weight.detach().sum(),
+        }
+        return pair_weight, metrics
+
+    def _get_eclip_binding_token_weight(
+        self,
+        feat_dict: dict[str, Any],
+        label_dict: dict[str, Any],
+        binding_token_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        cfg = self.configs.loss.eclip_binding_only
+        dtype = label_dict["coordinate"].dtype
+        base_weight = torch.full_like(
+            binding_token_mask,
+            fill_value=float(cfg.non_binding_token_weight),
+            dtype=dtype,
+        )
+        binding_weight = torch.ones_like(binding_token_mask, dtype=dtype)
+        token_weight = torch.where(binding_token_mask, binding_weight, base_weight)
+
+        radius = int(cfg.binding_window_radius)
+        if radius <= 0 or not bool(binding_token_mask.any().item()):
+            return token_weight
+
+        device = binding_token_mask.device
+        n_token = binding_token_mask.shape[0]
+        token_pos = feat_dict.get("residue_index")
+        if token_pos is None or token_pos.shape[-1] != n_token:
+            token_pos = torch.arange(n_token, device=device)
+        else:
+            token_pos = token_pos.to(device=device)
+
+        token_distance = torch.abs(token_pos[:, None] - token_pos[None, :])
+        window_pair_mask = token_distance <= radius
+        if cfg.binding_window_same_asym_only and "asym_id" in feat_dict:
+            asym_id = feat_dict["asym_id"].to(device=device)
+            if asym_id.shape[-1] == n_token:
+                window_pair_mask = window_pair_mask & (asym_id[:, None] == asym_id[None, :])
+
+        inf = torch.full_like(token_distance, fill_value=radius + 1)
+        distance_to_binding = torch.where(
+            window_pair_mask & binding_token_mask[None, :],
+            token_distance,
+            inf,
+        ).min(dim=-1).values
+        in_window_mask = distance_to_binding <= radius
+
+        min_weight = float(cfg.binding_window_min_weight)
+        if cfg.binding_window_decay == "flat":
+            window_weight = torch.full_like(token_weight, fill_value=min_weight)
+        elif cfg.binding_window_decay == "linear":
+            normalized_distance = distance_to_binding.to(dtype=dtype) / float(radius)
+            window_weight = min_weight + (1.0 - min_weight) * (
+                1.0 - normalized_distance
+            )
+        elif cfg.binding_window_decay == "gaussian":
+            sigma = max(float(radius) / 2.0, 1e-6)
+            window_weight = torch.exp(
+                -0.5 * (distance_to_binding.to(dtype=dtype) / sigma) ** 2
+            )
+            window_weight = torch.clamp(window_weight, min=min_weight)
+        else:
+            raise ValueError(
+                f"Unknown binding_window_decay: {cfg.binding_window_decay}"
+            )
+
+        window_weight = torch.where(in_window_mask, window_weight, base_weight)
+        return torch.maximum(token_weight, window_weight)
+
+    def _get_loss_weight_override(
+        self, use_eclip_binding_only: bool
+    ) -> Optional[dict[str, float]]:
+        if not use_eclip_binding_only:
+            return None
+        cfg = self.configs.loss.eclip_binding_only
+        loss_weight = {}
+        for loss_name, weight in self.loss_weight.items():
+            if loss_name == "distogram_loss":
+                loss_weight[loss_name] = weight * float(cfg.distogram_loss_weight_scale)
+            else:
+                loss_weight[loss_name] = weight * float(cfg.other_loss_weight_scale)
+        return loss_weight
+
     def calculate_label(
         self,
         feat_dict: dict[str, Any],
@@ -1556,6 +1782,7 @@ class ProtenixLoss(nn.Module):
         self,
         loss_fns: dict[str, Callable],
         has_valid_resolution: Optional[torch.Tensor] = None,
+        loss_weight_override: Optional[dict[str, float]] = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """
         Aggregates multiple loss functions and their respective metrics.
@@ -1572,7 +1799,11 @@ class ProtenixLoss(nn.Module):
         cum_loss = 0.0
         all_metrics = {}
         for loss_name, loss_fn in loss_fns.items():
-            weight = self.loss_weight[loss_name]
+            weight = (
+                loss_weight_override[loss_name]
+                if loss_weight_override is not None
+                else self.loss_weight[loss_name]
+            )
             loss_outputs = loss_fn()
             if isinstance(loss_outputs, tuple):
                 loss, metrics = loss_outputs
@@ -1644,6 +1875,15 @@ class ProtenixLoss(nn.Module):
             confidence_coordinate = "coordinate"
             # No scale is required
             diffusion_per_sample_scale = None
+
+        use_eclip_binding_only = self._is_eclip_binding_only_sample(feat_dict)
+        eclip_distogram_pair_weight = None
+        eclip_distogram_metrics = {}
+        if use_eclip_binding_only:
+            (
+                eclip_distogram_pair_weight,
+                eclip_distogram_metrics,
+            ) = self._get_eclip_distogram_pair_weight(feat_dict, label_dict)
 
         if self.configs.train_confidence_only and mode == "train":
             # Skip Diffusion Loss and distogram loss
@@ -1721,11 +1961,15 @@ class ProtenixLoss(nn.Module):
             if "distogram" in pred_dict:
                 loss_fns.update(
                     {
-                        "distogram_loss": lambda: self.distogram_loss(
-                            logits=pred_dict["distogram"],
-                            true_coordinate=label_dict["coordinate"],
-                            coordinate_mask=label_dict["coordinate_mask"],
-                            rep_atom_mask=feat_dict["distogram_rep_atom_mask"],
+                        "distogram_loss": lambda: (
+                            self.distogram_loss(
+                                logits=pred_dict["distogram"],
+                                true_coordinate=label_dict["coordinate"],
+                                coordinate_mask=label_dict["coordinate_mask"],
+                                rep_atom_mask=feat_dict["distogram_rep_atom_mask"],
+                                token_pair_weight=eclip_distogram_pair_weight,
+                            ),
+                            eclip_distogram_metrics,
                         )
                     }
                 )
@@ -1796,7 +2040,11 @@ class ProtenixLoss(nn.Module):
                 }
             )
 
-        cum_loss, metrics = self.aggregate_losses(loss_fns, has_valid_resolution)
+        cum_loss, metrics = self.aggregate_losses(
+            loss_fns=loss_fns,
+            has_valid_resolution=has_valid_resolution,
+            loss_weight_override=self._get_loss_weight_override(use_eclip_binding_only),
+        )
         return cum_loss, metrics
 
     def forward(
