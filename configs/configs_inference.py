@@ -33,7 +33,7 @@ inference_configs = {
     "enable_efficient_fusion": True,
     "enable_diffusion_shared_vars_cache": True,
     "msa_pair_as_unpair": True,
-    "use_template": False,
+    "use_template": True,
     "use_rna_msa": False,
     "use_seeds_in_json": False,
 }

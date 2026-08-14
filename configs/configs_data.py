@@ -19,7 +19,14 @@ from pathlib import Path
 
 from protenix.config.extend_types import GlobalConfigValue, ListValue
 
-PROTENIX_ROOT_DIR = os.environ.get("PROTENIX_ROOT_DIR", str(Path.home()))
+# PROTENIX_ROOT_DIR = os.environ.get("PROTENIX_ROOT_DIR", str(Path.home()))
+PROTENIX_ROOT_DIR = os.environ.get("PROTENIX_ROOT_DIR", "/inspire/ssd/project/sais-bio/public/Protein/data/AI_Models/protenix_v1_dataset/")
+rna_msa_dir = os.environ.get("PROTENIX_RNA_DATA_ROOT_DIR", PROTENIX_ROOT_DIR)
+# custom_rna_dir = "/inspire/ssd/project/sais-bio/public/xiangwenkai/GITHUB/Protenix_v1/data/"
+RNA_DATA_ROOT_DIR = os.environ.get("PROTENIX_DATA_ROOT_DIR", "/inspire/ssd/project/sais-bio/public/xiangwenkai/GITHUB/Protenix_v1/data")
+# mmcif_dir1 = "/root/ossfs2-bucket/xiangwenkai"
+mmcif_dir1 = "/inspire/ssd/project/sais-bio/public/xiangwenkai"
+
 
 default_test_configs = {
     "sampler_configs": {
@@ -141,15 +148,114 @@ data_configs = {
     # downloaded via `scripts/database/download_protenix_data.sh`.
     # `weightedPDB_before250701_v20260101` and `weightedPDB_before210930_v20260101` are compatible
     # with the `2026.01.01` data version.
-    "weightedPDB_before2109_wopb_nometalc_0925": {
+    # "weightedPDB_before2109_wopb_nometalc_0925": {
+    #     "base_info": {
+    #         "mmcif_dir": os.path.join(PROTENIX_ROOT_DIR, "mmcif"),
+    #         "bioassembly_dict_dir": os.path.join(
+    #             PROTENIX_ROOT_DIR, "mmcif_bioassembly"
+    #         ),
+    #         "indices_fpath": os.path.join(
+    #             PROTENIX_ROOT_DIR,
+    #             "indices/weightedPDB_indices_before_2021-09-30_wo_posebusters_resolution_below_9.csv.gz",
+    #         ),
+    #         "pdb_list": "",
+    #         "random_sample_if_failed": True,
+    #         "max_n_token": -1,  # can be used for removing data with too many tokens.
+    #         "use_reference_chains_only": False,
+    #         "exclusion": {  # do not sample the data based on ions.
+    #             "mol_1_type": ListValue(["ions"]),
+    #             "mol_2_type": ListValue(["ions"]),
+    #         },
+    #     },
+    #     **deepcopy(default_weighted_pdb_configs),
+    # },
+    # "weightedPDB_before250701_v20260101": {
+    #     "base_info": {
+    #         "mmcif_dir": os.path.join(PROTENIX_ROOT_DIR, "mmcif"),
+    #         "bioassembly_dict_dir": os.path.join(
+    #             PROTENIX_ROOT_DIR, "mmcif_bioassembly"
+    #         ),
+    #         "indices_fpath": os.path.join(
+    #             PROTENIX_ROOT_DIR,
+    #             "indices/indices_20260107-20chains_before_2025-07-01_res4.5.csv.gz",
+    #         ),
+    #         "pdb_list": "",
+    #         "random_sample_if_failed": True,
+    #         "max_n_token": -1,  # can be used for removing data with too many tokens.
+    #         "use_reference_chains_only": False,
+    #         "exclusion": {  # do not sample the data based on ions.
+    #             "mol_1_type": ListValue(["ions"]),
+    #             "mol_2_type": ListValue(["ions"]),
+    #         },
+    #     },
+    #     **deepcopy(default_weighted_pdb_configs),
+    # },
+    # "weightedPDB_before210930_v20260101": {
+    #     "base_info": {
+    #         "mmcif_dir": os.path.join(PROTENIX_ROOT_DIR, "mmcif"),
+    #         "bioassembly_dict_dir": os.path.join(
+    #             PROTENIX_ROOT_DIR, "mmcif_bioassembly"
+    #         ),
+    #         "indices_fpath": os.path.join(
+    #             PROTENIX_ROOT_DIR,
+    #             "indices/indices_20260107-20chains_before_2021-09-30_res4.5.csv.gz",
+    #         ),
+    #         "pdb_list": "",
+    #         "random_sample_if_failed": True,
+    #         "max_n_token": -1,  # can be used for removing data with too many tokens.
+    #         "use_reference_chains_only": False,
+    #         "exclusion": {  # do not sample the data based on ions.
+    #             "mol_1_type": ListValue(["ions"]),
+    #             "mol_2_type": ListValue(["ions"]),
+    #         },
+    #     },
+    #     **deepcopy(default_weighted_pdb_configs),
+    # },
+    # "recentPDB_1536_sample384_0925": {
+    #     "base_info": {
+    #         "mmcif_dir": os.path.join(PROTENIX_ROOT_DIR, "mmcif"),
+    #         "bioassembly_dict_dir": os.path.join(
+    #             PROTENIX_ROOT_DIR, "recentPDB_bioassembly"
+    #         ),
+    #         "indices_fpath": os.path.join(
+    #             PROTENIX_ROOT_DIR, "indices/recentPDB_low_homology_maxtoken1536.csv"
+    #         ),
+    #         "pdb_list": os.path.join(
+    #             PROTENIX_ROOT_DIR,
+    #             "indices/recentPDB_low_homology_maxtoken1024_sample384_pdb_id.txt",
+    #         ),
+    #         "max_n_token": GlobalConfigValue("test_max_n_token"),  # filter data
+    #         "sort_by_n_token": False,
+    #         "group_by_pdb_id": True,
+    #         "find_eval_chain_interface": True,
+    #     },
+    #     **deepcopy(default_test_configs),
+    # },
+    # "posebusters_0925": {
+    #     "base_info": {
+    #         "mmcif_dir": os.path.join(PROTENIX_ROOT_DIR, "posebusters_mmcif"),
+    #         "bioassembly_dict_dir": os.path.join(
+    #             PROTENIX_ROOT_DIR, "posebusters_bioassembly"
+    #         ),
+    #         "indices_fpath": os.path.join(
+    #             PROTENIX_ROOT_DIR, "indices/posebusters_indices_mainchain_interface.csv"
+    #         ),
+    #         "pdb_list": "",
+    #         "find_pocket": True,
+    #         "find_all_pockets": False,
+    #         "max_n_token": GlobalConfigValue("test_max_n_token"),  # filter data
+    #     },
+    #     **deepcopy(default_test_configs),
+    # },
+    "train_rna_before202606": {
         "base_info": {
-            "mmcif_dir": os.path.join(PROTENIX_ROOT_DIR, "mmcif"),
+            "mmcif_dir": os.path.join(RNA_DATA_ROOT_DIR, "protein_rna"),
             "bioassembly_dict_dir": os.path.join(
-                PROTENIX_ROOT_DIR, "mmcif_bioassembly"
+                RNA_DATA_ROOT_DIR, "train_signal"
             ),
             "indices_fpath": os.path.join(
-                PROTENIX_ROOT_DIR,
-                "indices/weightedPDB_indices_before_2021-09-30_wo_posebusters_resolution_below_9.csv.gz",
+                # RNA_DATA_ROOT_DIR, "protein_rna_train.csv"
+                RNA_DATA_ROOT_DIR, "protein_rna_train_filter.csv"
             ),
             "pdb_list": "",
             "random_sample_if_failed": True,
@@ -162,81 +268,292 @@ data_configs = {
         },
         **deepcopy(default_weighted_pdb_configs),
     },
-    "weightedPDB_before250701_v20260101": {
+    "weightedPDB_before2109_protein_rna": {
         "base_info": {
             "mmcif_dir": os.path.join(PROTENIX_ROOT_DIR, "mmcif"),
             "bioassembly_dict_dir": os.path.join(
                 PROTENIX_ROOT_DIR, "mmcif_bioassembly"
             ),
             "indices_fpath": os.path.join(
-                PROTENIX_ROOT_DIR,
-                "indices/indices_20260107-20chains_before_2025-07-01_res4.5.csv.gz",
+                RNA_DATA_ROOT_DIR, "weightedPDB_before2109_protein_rna_indices.csv"
             ),
             "pdb_list": "",
             "random_sample_if_failed": True,
-            "max_n_token": -1,  # can be used for removing data with too many tokens.
+            "max_n_token": -1,
             "use_reference_chains_only": False,
-            "exclusion": {  # do not sample the data based on ions.
+            "exclusion": {
                 "mol_1_type": ListValue(["ions"]),
                 "mol_2_type": ListValue(["ions"]),
             },
         },
         **deepcopy(default_weighted_pdb_configs),
     },
-    "weightedPDB_before210930_v20260101": {
+    "protein_rna_recent": {
         "base_info": {
-            "mmcif_dir": os.path.join(PROTENIX_ROOT_DIR, "mmcif"),
+            "mmcif_dir": os.path.join(RNA_DATA_ROOT_DIR, "protein_rna"),
             "bioassembly_dict_dir": os.path.join(
-                PROTENIX_ROOT_DIR, "mmcif_bioassembly"
+                RNA_DATA_ROOT_DIR, "train_signal"
             ),
             "indices_fpath": os.path.join(
-                PROTENIX_ROOT_DIR,
-                "indices/indices_20260107-20chains_before_2021-09-30_res4.5.csv.gz",
+                RNA_DATA_ROOT_DIR, "protein_rna_recent_indices.csv"
             ),
             "pdb_list": "",
             "random_sample_if_failed": True,
-            "max_n_token": -1,  # can be used for removing data with too many tokens.
+            "max_n_token": -1,
             "use_reference_chains_only": False,
-            "exclusion": {  # do not sample the data based on ions.
+            "exclusion": {
                 "mol_1_type": ListValue(["ions"]),
                 "mol_2_type": ListValue(["ions"]),
             },
         },
         **deepcopy(default_weighted_pdb_configs),
     },
-    "recentPDB_1536_sample384_0925": {
+    "distillation_eclip_lddt50": {
         "base_info": {
-            "mmcif_dir": os.path.join(PROTENIX_ROOT_DIR, "mmcif"),
+            "mmcif_dir": os.path.join(
+                mmcif_dir1, "GITHUB/parnet/data/distillation/data_v1/cif"
+            ),
             "bioassembly_dict_dir": os.path.join(
-                PROTENIX_ROOT_DIR, "recentPDB_bioassembly"
+                RNA_DATA_ROOT_DIR, "distillation_eclip_v1/bioassembly"
             ),
             "indices_fpath": os.path.join(
-                PROTENIX_ROOT_DIR, "indices/recentPDB_low_homology_maxtoken1536.csv"
+                RNA_DATA_ROOT_DIR, "distillation_eclip_v1/distillation_eclip_lddt50_indices.csv"
             ),
-            "pdb_list": os.path.join(
-                PROTENIX_ROOT_DIR,
-                "indices/recentPDB_low_homology_maxtoken1024_sample384_pdb_id.txt",
+            "pdb_list": "",
+            "random_sample_if_failed": True,
+            "max_n_token": -1,
+            "use_reference_chains_only": False,
+            "is_distillation": True,
+            "exclusion": {
+                "mol_1_type": ListValue(["ions"]),
+                "mol_2_type": ListValue(["ions"]),
+            },
+        },
+        # Protein MSA uses the same global source as train_rna_before202606:
+        # data.msa.prot_seq_or_filename_to_msadir_jsons and
+        # data.msa.prot_msadir_raw_paths.
+        # RNA MSA is intentionally disabled for this distillation set.
+        "msa": {
+            "enable_rna_msa": False,
+        },
+        **deepcopy(default_weighted_pdb_configs),
+    },
+    "distillation_eclip_lddt50_test": {
+        "base_info": {
+            "mmcif_dir": os.path.join(
+                mmcif_dir1, "GITHUB/parnet/data/distillation/data_v1/cif"
             ),
-            "max_n_token": GlobalConfigValue("test_max_n_token"),  # filter data
+            "bioassembly_dict_dir": os.path.join(
+                RNA_DATA_ROOT_DIR, "distillation_eclip_v1/bioassembly"
+            ),
+            "indices_fpath": os.path.join(
+                RNA_DATA_ROOT_DIR,
+                "distillation_eclip_v1/distillation_eclip_lddt50_test_indices.csv",
+            ),
+            "pdb_list": "",
+            "max_n_token": 1600,
             "sort_by_n_token": False,
             "group_by_pdb_id": True,
             "find_eval_chain_interface": True,
+            "is_distillation": True,
+        },
+        # Keep MSA behavior aligned with distillation_eclip:
+        # protein MSA uses the global train_rna_before202606 source;
+        # RNA MSA is disabled for this distillation set.
+        "msa": {
+            "enable_rna_msa": False,
         },
         **deepcopy(default_test_configs),
     },
-    "posebusters_0925": {
+    "distillation_eclip_v1": {
         "base_info": {
-            "mmcif_dir": os.path.join(PROTENIX_ROOT_DIR, "posebusters_mmcif"),
+            "mmcif_dir": os.path.join(
+                mmcif_dir1, "GITHUB/parnet/data/distillation/data_v1/cif"
+            ),
             "bioassembly_dict_dir": os.path.join(
-                PROTENIX_ROOT_DIR, "posebusters_bioassembly"
+                RNA_DATA_ROOT_DIR, "distillation_eclip_v1/bioassembly"
             ),
             "indices_fpath": os.path.join(
-                PROTENIX_ROOT_DIR, "indices/posebusters_indices_mainchain_interface.csv"
+                RNA_DATA_ROOT_DIR,
+                "distillation_eclip_v1/distillation_eclip_v1_train_indices.csv",
             ),
             "pdb_list": "",
-            "find_pocket": True,
-            "find_all_pockets": False,
-            "max_n_token": GlobalConfigValue("test_max_n_token"),  # filter data
+            "random_sample_if_failed": True,
+            "max_n_token": -1,
+            "use_reference_chains_only": False,
+            "is_distillation": True,
+            "exclusion": {
+                "mol_1_type": ListValue(["ions"]),
+                "mol_2_type": ListValue(["ions"]),
+            },
+        },
+        # Same MSA behavior as distillation_eclip.  The bioassembly pkl files
+        # additionally contain token-level distillation_residue_plddt and
+        # distillation_protein_rna_interface annotations.
+        "msa": {
+            "enable_rna_msa": False,
+        },
+        **deepcopy(default_weighted_pdb_configs),
+    },
+    "distillation_eclip_v1_test": {
+        "base_info": {
+            "mmcif_dir": os.path.join(
+                mmcif_dir1, "GITHUB/parnet/data/distillation/data_v1/cif"
+            ),
+            "bioassembly_dict_dir": os.path.join(
+                RNA_DATA_ROOT_DIR, "distillation_eclip_v1/bioassembly"
+            ),
+            "indices_fpath": os.path.join(
+                RNA_DATA_ROOT_DIR,
+                "distillation_eclip_v1/distillation_eclip_v1_test_indices.csv",
+            ),
+            "pdb_list": "",
+            "max_n_token": 1600,
+            "sort_by_n_token": False,
+            "group_by_pdb_id": True,
+            "find_eval_chain_interface": True,
+            "is_distillation": True,
+        },
+        "msa": {
+            "enable_rna_msa": False,
+        },
+        **deepcopy(default_test_configs),
+    },
+    "distillation_eclip_iface55": {
+        "base_info": {
+            "mmcif_dir": os.path.join(
+                mmcif_dir1,
+                "GITHUB/parnet/data/distillation/filter_data/strict_iface_plddt55_cif",
+            ),
+            "bioassembly_dict_dir": os.path.join(
+                RNA_DATA_ROOT_DIR, "distillation_eclip_v1/bioassembly"
+            ),
+            "indices_fpath": os.path.join(
+                RNA_DATA_ROOT_DIR,
+                "distillation_eclip_iface55/distillation_eclip_iface55_indices.csv",
+            ),
+            "pdb_list": "",
+            "random_sample_if_failed": True,
+            "max_n_token": -1,
+            "use_reference_chains_only": False,
+            "is_distillation": True,
+            "exclusion": {
+                "mol_1_type": ListValue(["ions"]),
+                "mol_2_type": ListValue(["ions"]),
+            },
+        },
+        # Keep MSA behavior aligned with distillation_eclip:
+        # protein MSA uses the global train_rna_before202606 source;
+        # RNA MSA is disabled for this distillation set.
+        "msa": {
+            "enable_rna_msa": False,
+        },
+        **deepcopy(default_weighted_pdb_configs),
+    },
+    "distillation_eclip_iface55_test": {
+        "base_info": {
+            "mmcif_dir": os.path.join(
+                mmcif_dir1,
+                "GITHUB/parnet/data/distillation/filter_data/strict_iface_plddt55_cif",
+            ),
+            "bioassembly_dict_dir": os.path.join(
+                RNA_DATA_ROOT_DIR, "distillation_eclip_v1/bioassembly"
+            ),
+            "indices_fpath": os.path.join(
+                RNA_DATA_ROOT_DIR,
+                "distillation_eclip_iface55_test/"
+                "distillation_eclip_iface55_test_indices.csv",
+            ),
+            "pdb_list": "",
+            "max_n_token": 1600,
+            "sort_by_n_token": False,
+            "group_by_pdb_id": True,
+            "find_eval_chain_interface": True,
+            "is_distillation": True,
+        },
+        # Keep MSA behavior aligned with distillation_eclip:
+        # protein MSA uses the global train_rna_before202606 source;
+        # RNA MSA is disabled for this distillation set.
+        "msa": {
+            "enable_rna_msa": False,
+        },
+        **deepcopy(default_test_configs),
+    },
+    "distillation_eclip_ensemble": {
+        "base_info": {
+            "mmcif_dir": os.path.join(
+                mmcif_dir1, "GITHUB/parnet/data/distillation/filter_data/ensemble_cif"
+            ),
+            "bioassembly_dict_dir": os.path.join(
+                RNA_DATA_ROOT_DIR, "distillation_eclip_ensemble/bioassembly"
+            ),
+            "indices_fpath": os.path.join(
+                RNA_DATA_ROOT_DIR,
+                "distillation_eclip_ensemble/distillation_eclip_ensemble_indices.csv",
+            ),
+            "pdb_list": "",
+            "random_sample_if_failed": True,
+            "max_n_token": -1,
+            "use_reference_chains_only": False,
+            "is_distillation": True,
+            "exclusion": {
+                "mol_1_type": ListValue(["ions"]),
+                "mol_2_type": ListValue(["ions"]),
+            },
+        },
+        # Keep MSA behavior aligned with distillation_eclip:
+        # protein MSA uses the global train_rna_before202606 source;
+        # RNA MSA is disabled for this distillation set.
+        "msa": {
+            "enable_rna_msa": False,
+        },
+        **deepcopy(default_weighted_pdb_configs),
+    },
+    "distillation_eclip_ensemble_test": {
+        "base_info": {
+            "mmcif_dir": os.path.join(
+                mmcif_dir1, "GITHUB/parnet/data/distillation/filter_data/ensemble_cif"
+            ),
+            "bioassembly_dict_dir": os.path.join(
+                RNA_DATA_ROOT_DIR, "distillation_eclip_ensemble/bioassembly"
+            ),
+            "indices_fpath": os.path.join(
+                RNA_DATA_ROOT_DIR,
+                "distillation_eclip_ensemble_test/distillation_eclip_ensemble_test_indices.csv",
+            ),
+            "pdb_list": "",
+            "max_n_token": 1600,
+            "sort_by_n_token": False,
+            "group_by_pdb_id": True,
+            "find_eval_chain_interface": True,
+            "is_distillation": True,
+        },
+        # Keep MSA behavior aligned with distillation_eclip:
+        # protein MSA uses the global train_rna_before202606 source;
+        # RNA MSA is disabled for this distillation set.
+        "msa": {
+            "enable_rna_msa": False,
+        },
+        **deepcopy(default_test_configs),
+    },
+    "test_rna_before202606": {
+        "base_info": {
+            "mmcif_dir": os.path.join(RNA_DATA_ROOT_DIR, "protein_rna"),
+            "bioassembly_dict_dir": os.path.join(
+                RNA_DATA_ROOT_DIR, "train_signal"
+            ),
+            "indices_fpath": os.path.join(
+                # RNA_DATA_ROOT_DIR, "protein_rna_test.csv"
+                RNA_DATA_ROOT_DIR, "protein_rna_test_filter_mini.csv"
+            ),
+            "pdb_list": "",
+            # "max_n_token": GlobalConfigValue("test_max_n_token"),  # filter data
+            "max_n_token": 1600,  # filter data
+            "sort_by_n_token": False,
+            "group_by_pdb_id": True,
+            "find_eval_chain_interface": True,
+            "skip_sample_if_failed": True,
+            "sample_timeout_seconds": 60,
         },
         **deepcopy(default_test_configs),
     },
@@ -293,7 +610,7 @@ data_configs = {
         "obsolete_pdbs_path": os.path.join(
             PROTENIX_ROOT_DIR, "common/obsolete_to_successor.json"
         ),
-        "kalign_binary_path": "/usr/bin/kalign",  # apt-get install kalign
+        "kalign_binary_path": "/inspire/ssd/project/sais-bio/public/xiangwenkai/anaconda3/envs/protenix/bin/kalign",  # apt-get install kalign
     },
     "ccd_components_file": os.path.join(PROTENIX_ROOT_DIR, "common/components.cif"),
     "ccd_components_rdkit_mol_file": os.path.join(
