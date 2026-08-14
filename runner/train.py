@@ -17,8 +17,10 @@ import hashlib
 import logging
 import os
 import time
+import traceback
 from argparse import Namespace
 from contextlib import nullcontext
+from pathlib import Path
 from typing import Any, Dict, Mapping, Tuple
 
 import torch
@@ -49,6 +51,67 @@ from runner.ema import EMAWrapper
 os.environ["WANDB_CONSOLE"] = "off"
 
 torch.serialization.add_safe_globals([Namespace])
+
+base_dir = "/inspire/ssd/project/sais-bio/public"
+# base_dir = ""
+foldbench_bundle_dir = f"{base_dir}/xiangwenkai/Protenix_v3/foldbench/protein_rna"
+FOLDBENCH_EVAL_CONFIGS = {
+    "foldbench_eval": {
+        "enable": False,
+        "start_index": 0,
+        "seeds": "102",
+        "cycle": 10,
+        "step": 200,
+        "sample": 1,
+        "dtype": "bf16",
+        "use_msa": True,
+        "use_rna_msa": True,
+        "msa_server_mode": "protenix",
+        "metric_type": "rank",
+        "skip_dockqv2": False,
+        "dockq_allowed_mismatches": 8,
+        "filter_to_train_pdb_hits": False,
+        "filter_train_set": "",
+        "ground_truth_dir": f"{foldbench_bundle_dir}/data/ground_truth_cif",
+        "foldbench_repo": f"{foldbench_bundle_dir}/third_party/FoldBench",
+        "foldbench_conda_env": "foldbench",
+        "foldbench_conda_executable": f"{base_dir}/xiangwenkai/anaconda3/bin/conda",
+        "targets_dir": f"{foldbench_bundle_dir}/data/targets",
+        "mmcif_dir": (
+            f"{base_dir}/Protein/data/AI_Models/"
+            "protenix_v1_dataset/mmcif"
+        ),
+        "seq_to_pdb_index": (
+            f"{base_dir}/Protein/data/AI_Models/"
+            "protenix_v1_dataset/common/seq_to_pdb_index.json"
+        ),
+        "msa_template_dir": (
+            f"{base_dir}/Protein/data/AI_Models/"
+            "protenix_v1_dataset/mmcif_msa_template"
+        ),
+        "rna_msa_cache_root": (
+            f"{base_dir}/Protein/data/AI_Models/"
+            "protenix_v1_dataset/rna_msa"
+        ),
+        "foldbench_rna_msa_cache_root": f"{foldbench_bundle_dir}/data/rna_msa",
+        "ntrna_database_path": (
+            f"{base_dir}/Protein/data/AI_Models/"
+            "protenix_v1_dataset/search_database/"
+            "nt_rna_2023_02_23_clust_seq_id_90_cov_80_rep_seq.fasta"
+        ),
+        "rfam_database_path": (
+            f"{base_dir}/Protein/data/AI_Models/"
+            "protenix_v1_dataset/search_database/"
+            "rfam_14_9_clust_seq_id_90_cov_80_rep_seq.fasta"
+        ),
+        "rna_central_database_path": (
+            f"{base_dir}/Protein/data/AI_Models/"
+            "protenix_v1_dataset/search_database/"
+            "rnacentral_active_seq_id_90_cov_80_linclust.fasta"
+        ),
+        "nhmmer_n_cpu": 2,
+    },
+}
 
 
 class AF3Trainer(object):
@@ -489,6 +552,39 @@ class AF3Trainer(object):
             self.ema_wrapper.apply_shadow()
             self._evaluate(ema_suffix=f"ema{self.ema_wrapper.decay}_", mode=mode)
             self.ema_wrapper.restore()
+        foldbench_metrics = self.evaluate_foldbench()
+        if foldbench_metrics and self.configs.use_wandb and DIST_WRAPPER.rank == 0:
+            wandb.log(foldbench_metrics, step=self.step)
+
+    def evaluate_foldbench(self) -> Dict[str, float]:
+        """
+        Run FoldBench protein-RNA validation with the current parameters.
+
+        Returns an empty dict when foldbench_eval is disabled; on failure in
+        non-DDP runs returns {"foldbench/failed": 1.0} so training continues.
+        """
+        fold_cfg = getattr(self.configs, "foldbench_eval", None)
+        if fold_cfg is None or not fold_cfg.enable:
+            return {}
+        from protenix.eval.foldbench_validation import run_foldbench_validation
+
+        self.print(f"Running FoldBench validation at step {self.step}")
+        try:
+            metrics = run_foldbench_validation(
+                model=self.raw_model,
+                train_configs=self.configs,
+                fold_cfg=fold_cfg,
+                run_dir=Path(self.run_dir),
+                step=self.step,
+                device=self.device,
+            )
+            self.print(f"Step {self.step} FoldBench metrics: {metrics}")
+            return metrics
+        except Exception:
+            if self.use_ddp:
+                raise
+            self.print(f"FoldBench validation failed:\n{traceback.format_exc()}")
+            return {"foldbench/failed": 1.0}
 
     @torch.no_grad()
     def _evaluate(self, ema_suffix: str = "", mode: str = "eval") -> None:
@@ -752,7 +848,11 @@ def main() -> None:
         "TRIANGLE_MULTIPLICATIVE", "cuequivariance"
     )
     arg_str = parse_sys_args()
-    configs = {**configs_base, **{"data": data_configs}}
+    configs = {
+        **configs_base,
+        **{"data": data_configs},
+        **FOLDBENCH_EVAL_CONFIGS,
+    }
     # 1. First pass to get model_name
     configs = parse_configs(
         configs,
@@ -762,7 +862,11 @@ def main() -> None:
     model_name = configs.model_name
 
     # 2. Get model specifics and merge into base defaults
-    base_configs = {**configs_base, **{"data": data_configs}}
+    base_configs = {
+        **configs_base,
+        **{"data": data_configs},
+        **FOLDBENCH_EVAL_CONFIGS,
+    }
     model_specfics_configs = model_configs[model_name]
 
     def deep_update(d, u):
