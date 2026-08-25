@@ -275,6 +275,7 @@ class DistributedDataLoader(DataLoader):
         drop_last: bool = True,
         shuffle: bool = True,
         sampler: Sampler = None,
+        **kwargs,
     ):
         if sampler is not None:
             self.sampler = sampler
@@ -290,6 +291,7 @@ class DistributedDataLoader(DataLoader):
             sampler=self.sampler,
             shuffle=False,
             collate_fn=collate_fn,
+            **kwargs,
         )
         self.counter = 0
 
@@ -317,6 +319,30 @@ def get_dataloaders(
 
     """
     train_dataset, test_datasets = get_datasets(configs, error_dir)
+    requested_num_workers = int(configs.data.num_dl_workers)
+    max_total_workers = int(configs.data.get("max_total_dl_workers", -1))
+    if max_total_workers > 0 and world_size > 1:
+        max_workers_per_rank = max(1, max_total_workers // world_size)
+        num_workers = min(requested_num_workers, max_workers_per_rank)
+    else:
+        num_workers = requested_num_workers
+    dataloader_kwargs = {}
+    if num_workers > 0:
+        dataloader_kwargs["prefetch_factor"] = int(
+            configs.data.get("dl_prefetch_factor", 1)
+        )
+        dataloader_kwargs["persistent_workers"] = bool(
+            configs.data.get("dl_persistent_workers", False)
+        )
+    if num_workers != requested_num_workers:
+        logger.info(
+            "Capping dataloader workers per rank from %s to %s "
+            "(world_size=%s, max_total_dl_workers=%s)",
+            requested_num_workers,
+            num_workers,
+            world_size,
+            max_total_workers,
+        )
     if world_size > 1:
         train_sampler = DistributedWeightedSampler(
             train_dataset,
@@ -329,9 +355,10 @@ def get_dataloaders(
             dataset=train_dataset,
             batch_size=1,
             shuffle=False,
-            num_workers=configs.data.num_dl_workers,
+            num_workers=num_workers,
             collate_fn=collate_fn_first,
             sampler=train_sampler,
+            **dataloader_kwargs,
         )
     else:
 
@@ -345,9 +372,10 @@ def get_dataloaders(
             dataset=train_dataset,
             batch_size=1,
             shuffle=False,
-            num_workers=configs.data.num_dl_workers,
+            num_workers=num_workers,
             collate_fn=collate_fn_first,
             sampler=train_sampler,
+            **dataloader_kwargs,
         )
 
     test_dls = {}
@@ -363,9 +391,10 @@ def get_dataloaders(
             test_dataset,
             batch_size=1,
             shuffle=False,
-            num_workers=configs.data.num_dl_workers,
+            num_workers=num_workers,
             sampler=test_sampler,
             collate_fn=collate_fn_first,
+            **dataloader_kwargs,
         )
     logger.info(
         f"train data size: {len(train_dataset)}, test size: {test_dataset_sizes}"
