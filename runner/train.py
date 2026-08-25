@@ -53,7 +53,7 @@ os.environ["WANDB_CONSOLE"] = "off"
 torch.serialization.add_safe_globals([Namespace])
 
 base_dir = "/inspire/ssd/project/sais-bio/public"
-# base_dir = ""
+# base_dir = "/ossfs2-bucket"
 foldbench_bundle_dir = f"{base_dir}/xiangwenkai/Protenix_v3/foldbench/protein_rna"
 FOLDBENCH_EVAL_CONFIGS = {
     "foldbench_eval": {
