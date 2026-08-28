@@ -1052,6 +1052,10 @@ def get_data_shape_dict(
     label = {
         "coordinate": (num_atom, 3),
         "coordinate_mask": (num_atom,),
+        "eclip_rna_binding_signal": (num_token,),
+        "eclip_rna_binding_signal_mask": (num_token,),
+        "distillation_residue_plddt": (num_token,),
+        "distillation_residue_plddt_mask": (num_token,),
         # "centre_atom_mask": (num_atom,),
         # "centre_centre_distance": (num_token, num_token),
         # "centre_centre_distance_mask": (num_token, num_token),

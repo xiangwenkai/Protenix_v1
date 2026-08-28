@@ -39,7 +39,12 @@ class ListValue(object):
     def __init__(self, value, dtype=None):
         if value is not None:
             self.value = value
-            self.dtype = type(value[0])
+            if value:
+                self.dtype = type(value[0])
+            elif dtype is not None:
+                self.dtype = dtype
+            else:
+                raise ValueError("dtype is required when ListValue has an empty default")
         else:
             self.value = None
             self.dtype = dtype

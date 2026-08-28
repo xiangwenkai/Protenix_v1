@@ -108,6 +108,8 @@ class BaseSingleDataset(Dataset):
             self.pdb_list = None
         # Used for removing rows in the indices list. Column names and excluded values are specified in this dict.
         self.exclusion_dict = kwargs.get("exclusion", {})
+        # Optional allow-list counterpart to exclusion, used by task-specific training pipelines.
+        self.inclusion_dict = kwargs.get("inclusion", {})
         self.limits = kwargs.get(
             "limits", -1
         )  # Limit number of indices rows, mainly for test
@@ -202,6 +204,23 @@ class BaseSingleDataset(Dataset):
             )
             self.check_indices_list(
                 indices_list, f"min_n_token ({self.min_n_token}) filtering"
+            )
+
+        # Filter by inclusion_dict
+        for col_name, inclusion_list in self.inclusion_dict.items():
+            cols = col_name.split("|")
+            inclusion_set = {tuple(value.split("|")) for value in inclusion_list}
+
+            def is_included(row):
+                return tuple(str(row[col]) for col in cols) in inclusion_set
+
+            valid_mask = indices_list.apply(is_included, axis=1)
+            indices_list = indices_list[valid_mask].reset_index(drop=True)
+            logger.info(
+                f"[Included by {col_name} -- {inclusion_list}] #Rows: {len(indices_list)}"
+            )
+            self.check_indices_list(
+                indices_list, f"inclusion_dict ({col_name}) filtering"
             )
 
         # Filter by exclusion_dict
@@ -767,6 +786,13 @@ class BaseSingleDataset(Dataset):
         signal_mask = cls._get_optional_token_annotation(
             token_array, "rna_binding_signal_mask"
         )
+        if signal is None:
+            signal = cls._get_optional_token_annotation(
+                token_array, "eclip_rna_binding_signal"
+            )
+            signal_mask = cls._get_optional_token_annotation(
+                token_array, "eclip_rna_binding_signal_mask"
+            )
         if signal is not None:
             binding_mask = signal.astype(np.float32) > 0.0
             if signal_mask is not None:
@@ -782,6 +808,71 @@ class BaseSingleDataset(Dataset):
             )
 
         return torch.zeros(len(token_array), dtype=torch.float32)
+
+    @classmethod
+    def _get_precomputed_eclip_signal(
+        cls, token_array: TokenArray
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Read the continuous eCLIP signal and its valid-position mask."""
+
+        signal = cls._get_optional_token_annotation(
+            token_array, "eclip_rna_binding_signal"
+        )
+        signal_mask = cls._get_optional_token_annotation(
+            token_array, "eclip_rna_binding_signal_mask"
+        )
+        if signal is None:
+            signal = cls._get_optional_token_annotation(
+                token_array, "rna_binding_signal"
+            )
+            signal_mask = cls._get_optional_token_annotation(
+                token_array, "rna_binding_signal_mask"
+            )
+
+        if signal is None:
+            return (
+                torch.zeros(len(token_array), dtype=torch.float32),
+                torch.zeros(len(token_array), dtype=torch.bool),
+            )
+        if signal_mask is None:
+            raise ValueError(
+                "Found an eCLIP RNA binding signal without its signal mask in the prepared pkl."
+            )
+        if len(signal) != len(token_array) or len(signal_mask) != len(token_array):
+            raise ValueError(
+                "The token-level eCLIP signal and mask must match the cropped token count."
+            )
+        return (
+            torch.from_numpy(signal.astype(np.float32)),
+            torch.from_numpy(signal_mask.astype(bool)),
+        )
+
+    @classmethod
+    def _get_precomputed_distillation_plddt(
+        cls, token_array: TokenArray
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Read optional token-level confidence for a weak pseudo-structure anchor."""
+        plddt = cls._get_optional_token_annotation(
+            token_array, "distillation_residue_plddt"
+        )
+        plddt_mask = cls._get_optional_token_annotation(
+            token_array, "distillation_residue_plddt_mask"
+        )
+        if plddt is None:
+            return (
+                torch.zeros(len(token_array), dtype=torch.float32),
+                torch.zeros(len(token_array), dtype=torch.bool),
+            )
+        if plddt_mask is None:
+            plddt_mask = np.isfinite(plddt)
+        if len(plddt) != len(token_array) or len(plddt_mask) != len(token_array):
+            raise ValueError(
+                "The token-level distillation pLDDT and mask must match the cropped token count."
+            )
+        return (
+            torch.from_numpy(plddt.astype(np.float32)),
+            torch.from_numpy(plddt_mask.astype(bool)),
+        )
 
     def get_feature_and_label(
         self,
@@ -925,6 +1016,16 @@ class BaseSingleDataset(Dataset):
         features_dict = make_dummy_feature(
             features_dict=features_dict, dummy_feats=dummy_feats
         )
+        eclip_signal, eclip_signal_mask = self._get_precomputed_eclip_signal(
+            token_array
+        )
+        labels_dict["eclip_rna_binding_signal"] = eclip_signal
+        labels_dict["eclip_rna_binding_signal_mask"] = eclip_signal_mask
+        distillation_plddt, distillation_plddt_mask = (
+            self._get_precomputed_distillation_plddt(token_array)
+        )
+        labels_dict["distillation_residue_plddt"] = distillation_plddt
+        labels_dict["distillation_residue_plddt_mask"] = distillation_plddt_mask
         features_dict["eclip_binding_token_mask"] = (
             self._get_precomputed_eclip_binding_token_mask(token_array)
         )
